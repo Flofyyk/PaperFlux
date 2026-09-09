@@ -5,7 +5,7 @@ OUTPUT_DIR="output/ios"
 LIBRARY_NAME="liboflux"
 
 # Paths configuration
-XCODE_PATH="/path/to/Xcode.app"
+XCODE_PATH="${XCODE_PATH:-/Applications/Xcode.app}"
 DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
 SDK_PATH="$DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
 CLANG="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
