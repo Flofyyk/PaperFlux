@@ -51,6 +51,9 @@ SDK_PATH="$XCODE_PATH/Contents/Developer/Platforms/iPhoneOS.platform/Developer/S
 ## Usage
 
 Exit node (needs root):
+
+Please use the old document editor. At the moment, the application crashes if you use the new one. I will fix this problem as soon as possible.
+
 ```bash
 sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
 sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
