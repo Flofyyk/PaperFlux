@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-#ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.0.12077973}"
+ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.0.12077973}"
 OUTPUT_DIR="output/android/arm64-v8a"
 BINARY_NAME="openflux"
 
