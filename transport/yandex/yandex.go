@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"net/http"
 	"regexp"
@@ -105,7 +104,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		return
 	}
 
-	utils.Debugf("[YDOCS] connectToDoc attempt %d/%d", attempt+1, t.GetConfig().MaxReconnectAttempts)
+	utils.Debugf("[YDOCS] connectToDoc attempt ...")
 
 	go func() {
 		t.Mu.Lock()
@@ -296,10 +295,6 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	}
 
 	t.RecordReconnect()
-	delay := time.Duration(float64(t.GetConfig().ReconnectDelay) *
-		math.Pow(t.GetConfig().ReconnectMultiplier, float64(attempt)))
-
-        fmt.Println("[YDOCS] Reconnecting in %v...", delay)
 	t.connectToDoc(attempt + 1)
 }
 
