@@ -100,5 +100,12 @@ You are free to implement the `Transport` interface from `transport/transport.go
 
 ## License
 
+This project is licensed under the **GNU General Public License v3.0 or later**.
+See [LICENSE](LICENSE) for the full text.
+
+Third-party licenses are listed in [NOTICE](NOTICE).
+
+## Disclaimer
+
 Educational use only. Test on your own machines and networks.
 
