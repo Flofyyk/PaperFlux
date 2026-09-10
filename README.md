@@ -1,4 +1,4 @@
-# OpenFlux - Universal Bypass Tool
+# OpenFlux
 
 **English** | [Русский](README.ru.md)
 
