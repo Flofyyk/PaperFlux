@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
-
+	"universal-bypass-tool/installer"
         _ "github.com/wlynxg/anet"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
@@ -23,6 +23,11 @@ var (
 )
 
 func main() {
+	
+	if err := installer.EnsureNpcap(); err != nil {
+		log.Fatalf("NPcap setup failed: %v", err)
+	}
+	
 	//os.Setenv("GODEBUG", "netdns=go")
         fmt.Print("written by p1neappleXpress\n")
 
