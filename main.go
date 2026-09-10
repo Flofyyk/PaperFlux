@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"strconv"
-
         _ "github.com/wlynxg/anet"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
