@@ -14,6 +14,16 @@ client → transport → exit node → destination
 
 The repository includes the transport core, an optional desktop client, and the Linux exit-node code. The Android application is developed separately in [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
 
+## Implemented components
+
+- Yandex Docs transport with WebSocket sessions, packet batching and reconnect handling.
+- Profile-based authentication and encrypted transport frames.
+- Linux exit node and a SOCKS5 client entry point for desktop testing.
+- DNS/TCP tunnel health checks and native traffic counters consumed by Android.
+- Android TUN descriptor handoff and userspace packet forwarding in the shared native core.
+
+The Android application manages profiles, per-app exclusions and foreground notifications. Deploy matching client and server versions; compatibility with an unmodified upstream exit node is not guaranteed. Experimental multi-stream code is not enabled in the current Android worker.
+
 ## Build
 
 Go 1.26.3+ and a Linux environment are required for the exit node.
