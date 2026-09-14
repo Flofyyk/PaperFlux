@@ -1,58 +1,58 @@
 # PaperFlux Server
 
-**English** | [Русский](README.ru.md)
+[English](README.en.md) | **Русский**
 
-PaperFlux Server is experimental source code for studying document-based network transport and self-hosted exit nodes. It is the companion component for [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid), intended for infrastructure that you administer yourself.
+PaperFlux Server — экспериментальный исходный код для изучения документного сетевого транспорта и самостоятельных выходных нод. Это серверная часть для [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid), рассчитанная на инфраструктуру, которой вы управляете сами.
 
-This repository is a maintained fork of [p1neappleXpress/OpenFlux](https://github.com/p1neappleXpress/OpenFlux). It contains source code only: no hosted service, server access, documents, tokens, or user configurations are included.
+Это поддерживаемый fork [p1neappleXpress/OpenFlux](https://github.com/p1neappleXpress/OpenFlux). В репозитории находится только исходный код: здесь нет публичного сервиса, доступов к серверам, документов, токенов и пользовательских конфигураций.
 
-## Project layout
+## Схема проекта
 
 ```text
-client → transport → exit node → destination
+клиент → транспорт → выходная нода → назначение
 ```
 
-The repository includes the transport core, an optional desktop client, and the Linux exit-node code. The Android application is developed separately in [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
+В репозитории есть транспортное ядро, необязательный десктопный клиент и код Linux-выходной ноды. Android-приложение разрабатывается отдельно в [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
 
-## Implemented components
+## Что реализовано
 
-- Yandex Docs transport with WebSocket sessions, packet batching and reconnect handling.
-- Profile-based authentication and encrypted transport frames.
-- Linux exit node and a SOCKS5 client entry point for desktop testing.
-- DNS/TCP tunnel health checks and native traffic counters consumed by Android.
-- Android TUN descriptor handoff and userspace packet forwarding in the shared native core.
+- Транспорт Yandex Docs: WebSocket-сессии, объединение пакетов и восстановление соединения.
+- Авторизация по профилю и шифрование транспортных сообщений.
+- Linux-выходная нода и локальный SOCKS5 для тестирования десктопного клиента.
+- Проверки DNS/TCP через туннель и счётчики трафика для Android.
+- Передача TUN-дескриптора и обработка пакетов Android в общем нативном ядре.
 
-The Android application manages profiles, per-app exclusions and foreground notifications. Deploy matching client and server versions; compatibility with an unmodified upstream exit node is not guaranteed. Experimental multi-stream code is not enabled in the current Android worker.
+Android-приложение отдельно управляет профилями, исключениями приложений и уведомлениями. Используйте согласованные версии клиента и сервера: совместимость с неизменённой выходной нодой OpenFlux не гарантируется. Экспериментальный multi-stream не включён в текущем Android-клиенте.
 
-## Build
+## Сборка
 
-Go 1.26.3+ and a Linux environment are required for the exit node.
+Для выходной ноды нужны Go 1.26.3+ и Linux.
 
 ```bash
 go mod tidy
 go build -o paperflux .
 ```
 
-## Local testing
+## Локальное тестирование
 
-Run only on a server and with a document configuration that you own or are authorized to use:
+Запускайте только на собственном сервере и с документной конфигурацией, на которую у вас есть право:
 
 ```bash
 sudo ./paperflux --exit-node --url "YOUR_DOCUMENT_URL"
 ```
 
-For a local desktop experiment, start the client with a local SOCKS listener:
+Для локального эксперимента на десктопе можно поднять SOCKS-listener:
 
 ```bash
 ./paperflux --client --url "YOUR_DOCUMENT_URL" --socks5 :1080
 ```
 
-## License
+## Лицензия
 
-This project is distributed under [GNU GPL v3.0 or later](LICENSE). Third-party notices are listed in [NOTICE](NOTICE).
+Проект распространяется по [GNU GPL v3.0 or later](LICENSE). Уведомления о сторонних компонентах находятся в [NOTICE](NOTICE).
 
-## Disclaimer
+## Отказ от ответственности
 
-PaperFlux is experimental research software provided **as is**, without warranties or guarantees of availability, privacy, security, performance, or fitness for a particular purpose. The authors do not operate infrastructure for users, provide credentials, or accept responsibility for deployments made from this source code.
+PaperFlux — экспериментальное исследовательское ПО, предоставляемое «как есть», без гарантий доступности, приватности, безопасности, производительности или пригодности для конкретной цели. Авторы не предоставляют инфраструктуру, доступы или готовые конфигурации и не отвечают за развёртывания, сделанные из этого исходного кода.
 
-Use it only for education, research, and testing on systems, documents, servers, and networks you own or are explicitly authorized to use. You are solely responsible for legal compliance, server security, data handling, and all traffic generated by your deployment.
+Используйте проект только для обучения, исследований и тестов на собственных либо явно разрешённых системах, документах, серверах и сетях. За соблюдение законов, безопасность сервера, работу с данными и весь трафик, созданный вашим развёртыванием, отвечаете вы.
