@@ -4,7 +4,7 @@
 
 ## PaperFlux / Android client
 
-PaperFlux is the Android-facing product built on this transport core. Its profile-driven client and dark Material 3 interface are published separately in [PaperFlux Android](https://github.com/Flofyyk/OpenFluxAndroid).
+PepperFlux is the Android-facing product built on this transport core. Its profile-driven client and dark Material 3 interface are published separately in [PepperFlux Android](https://github.com/Flofyyk/PepperFluxAndroid).
 
 The Android app supplies its own document profile at runtime. Nothing in this repository is a user's access credential. A session flows from the Android TUN through the Yandex Engine.IO channel to an OpenFlux exit node, which opens the destination connection on the user's behalf.
 
