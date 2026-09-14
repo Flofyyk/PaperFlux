@@ -1,47 +1,38 @@
-# OpenFlux
+# PaperFlux Server
 
 [English](README.md) | **Русский**
 
-## PaperFlux / Android-клиент
+PaperFlux Server — транспортное ядро и Linux-выходная нода для клиента PaperFlux Android. Нода принимает кадры от клиента, передаёт их через канал Yandex Docs и открывает соединение назначения со стороны VPS. Android-приложение публикуется отдельно в репозитории [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
 
-PaperFlux — Android-клиент поверх этого транспортного ядра. Клиент с профилями и тёмным интерфейсом Material 3 публикуется отдельно в репозитории [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid), а серверная часть — в [PaperFlux](https://github.com/Flofyyk/PaperFlux).
-
-Приложение получает документ и остальные параметры профиля во время импорта. Пользовательские секреты не зашиты в этот репозиторий. Путь сессии: Android TUN → канал Yandex Engine.IO → выходная нода OpenFlux → соединение назначения.
+Это поддерживаемый fork [p1neappleXpress/OpenFlux](https://github.com/p1neappleXpress/OpenFlux). В PaperFlux добавлены профильный сценарий клиента, ограниченные адаптивные батчи, проверки сессии и инструкции развёртывания. URL документа, токены и доступы к VPS в репозитории не хранятся.
 
 ### Путь трафика
 
 ```text
-Android TUN → native OpenFlux client → Yandex Docs Engine.IO/WebSocket
-           → OpenFlux exit node → TCP destination
+Android TUN → PaperFlux native client → Yandex Docs Engine.IO/WebSocket
+           → PaperFlux exit node → TCP destination
 ```
 
-Адаптер Yandex выполняет штатный polling-handshake, WebSocket upgrade и Socket.IO-аутентификацию до передачи данных. Формат кадров остаётся совместимым с Base64/Socket.IO и использует ограниченные адаптивные батчи.
+Адаптер Yandex выполняет polling, переходит на WebSocket, авторизует Socket.IO-сессию и передаёт ограниченные адаптивные батчи. Формат остаётся совместимым с Base64/Socket.IO, поэтому отдельный relay-протокол не требуется.
 
-Исследовательский инструмент сетевого стека. TCP-туннель с подключаемыми транспортами.
+## Компоненты
 
-## Обзор
-```
-Client (SOCKS5) --> Transport --> Exit Node --> Internet
-```
+- `transport/yandex` — polling, WebSocket upgrade, авторизация и кадрирование Yandex Docs;
+- `tunnel` — виртуальный интерфейс и пересылка пакетов;
+- `socks5` — необязательный SOCKS5-listener для десктопа;
+- `network` — разбор пакетов и контрольные суммы;
+- `transport/oneme` — необязательный транспорт MAX из upstream.
 
 ## Требования
-1. Golang v. 1.26.3+ — требуется для сборки бинарника десктопного клиента / выходной ноды (universal-bypass-tool);
+1. Golang v. 1.26.3+ — требуется для сборки бинарника десктопного клиента / выходной ноды;
 2. Android Native Development Kit (NDK) v.27.0.12077973+ — требуется для сборки бинарника для Android-клиента;
 3. XCode v. 26.6+ — требуется для сборки бинарника для iOS-клиента;
 4. VPS / VDS выходная нода на Linux.
 
-## Обзор
-
-TCP-пакеты передаются через Transport. На данный момент доступны два транспорта:
-1. Yandex — отправляет пакеты через курсорные сообщения Yandex Docs;
-2. Max — отправляет пакеты через WebRTC DataChannel.
-
-Клиентская часть запускает SOCKS5-прокси, выходная нода декапсулирует и пересылает пакеты в пункт назначения.
-
 ## Структура
 
 ```
-universal-bypass-tool/
+paperflux/
 ├── main.go
 ├── transport/
 │   ├── transport.go      # Transport interface
@@ -56,11 +47,11 @@ universal-bypass-tool/
 └── utils/                # Debug logging
 ```
 
-## Сборка (бинарник десктоп-клиента / выходной ноды)
+## Сборка
 
 ```bash
 go mod tidy
-go build -o universal-bypass-tool .
+go build -o paperflux .
 ```
 
 ## Сборка для Android (клиентский бинарник)
@@ -75,7 +66,7 @@ export XCODE_PATH="<путь до вашего Xcode.app>" # опциональ�
 ./build_ios.sh
 ```
 
-## Использование
+## Запуск выходной ноды
 
 ### 1. Настройка выходной ноды
 1. У вас должен быть root-доступ выходной ноде;
@@ -84,14 +75,14 @@ export XCODE_PATH="<путь до вашего Xcode.app>" # опциональ�
 Команды для настройки выходной ноды:
 ```bash
 sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
-sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
+sudo ./paperflux --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 ```
 
-### 1. Настройка десктопного клиента:
+## Запуск десктопного клиента
 
 Команды для настройки десктопного клиента:
 ```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
+./paperflux --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
 ```
 
 Затем настройте SOCKS5-прокси в браузере на localhost:1080.
@@ -111,7 +102,7 @@ sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 
 ## Реализация собственных транспортов
 
-Вы можете реализовать интерфейс `Transport` из `transport/transport.go` и зарегистрировать свой транспорт в switch-блоке в main.go.
+Новый backend можно реализовать через интерфейс `Transport` из `transport/transport.go` и зарегистрировать в селекторе транспортов. Для него отдельно опишите кадрирование, авторизацию и правила backpressure.
 
 ## Лицензия
 

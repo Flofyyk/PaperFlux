@@ -1,47 +1,38 @@
-# OpenFlux
+# PaperFlux Server
 
 **English** | [Русский](README.ru.md)
 
-## PaperFlux / Android client
+PaperFlux Server is the Linux exit-node and transport core used by the PaperFlux Android client. It accepts framed traffic from a client, carries it through a user-provided Yandex Docs channel, and opens the destination connection from the VPS. The Android application is maintained separately in [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
 
-PaperFlux is the Android-facing product built on this transport core. Its profile-driven client and dark Material 3 interface are published separately in [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid). The server repository is published as [PaperFlux](https://github.com/Flofyyk/PaperFlux).
-
-The Android app supplies its own document profile at runtime. Nothing in this repository is a user's access credential. A session flows from the Android TUN through the Yandex Engine.IO channel to an OpenFlux exit node, which opens the destination connection on the user's behalf.
+This repository is a maintained fork of [p1neappleXpress/OpenFlux](https://github.com/p1neappleXpress/OpenFlux). PaperFlux adds the client-facing profile flow, bounded adaptive batching, session checks, and the deployment documentation below. It does not contain a user's document URL, token, or VPS credentials.
 
 ### Transport path
 
 ```text
-Android TUN → native OpenFlux client → Yandex Docs Engine.IO/WebSocket
-           → OpenFlux exit node → TCP destination
+Android TUN → PaperFlux native client → Yandex Docs Engine.IO/WebSocket
+           → PaperFlux exit node → TCP destination
 ```
 
-The Yandex adapter performs the required polling handshake, WebSocket upgrade, and Socket.IO authorization before data transfer. Packet framing stays compatible with the existing Base64/Socket.IO transport and uses bounded adaptive batches.
-
-Network stack research tool. TCP tunnel with pluggable transports.
-
-## Overview
-```
-Client (SOCKS5) --> Transport --> Exit Node --> Internet
-```
+The Yandex adapter performs polling, upgrades to WebSocket, authorizes the Socket.IO session, and then transfers bounded adaptive batches. The wire format remains compatible with Base64/Socket.IO so an existing document can be used without a second relay protocol.
 
 ## Requirements
-1. Golang v. 1.26.3+ - is required for building desktop client / exit node binary (universal-bypass-tool);
+1. Golang v. 1.26.3+ - is required for building the desktop client / exit-node binary;
 2. Android Native Development Kit (NDK) v.27.0.12077973+ - is required for building Android client binary;
 3. XCode v. 26.6+ - is required for building iOS client binary;
 4. Linux VPS / VDS exit node.
 
-## Overview
+## Components
 
-TCP packets are sent via Transport. Currently, there are two transports available:
-1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets via WebRTC DataChannel.
-
-Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to destination point.
+- `transport/yandex` — Yandex Docs polling, WebSocket upgrade, authorization, and framing;
+- `tunnel` — virtual interface and packet forwarding;
+- `socks5` — optional desktop SOCKS5 listener;
+- `network` — packet parsing and checksums;
+- `transport/oneme` — the optional MAX transport inherited from upstream.
 
 ## Structure
 
 ```
-universal-bypass-tool/
+paperflux/
 ├── main.go
 ├── transport/
 │   ├── transport.go      # Transport interface
@@ -56,11 +47,11 @@ universal-bypass-tool/
 └── utils/                # Debug logging
 ```
 
-## Build (desktop client / exit-node binary)
+## Build
 
 ```bash
 go mod tidy
-go build -o universal-bypass-tool .
+go build -o paperflux .
 ```
 
 ## Build for Android (client binary)
@@ -75,7 +66,7 @@ export XCODE_PATH="<your Xcode.app path>" # optional, defaults to /Applications/
 ./build_ios.sh
 ```
 
-## Usage
+## Run an exit node
 
 ### 1. Setting up exit node
 1. You must have root access on exit node machine;
@@ -84,14 +75,14 @@ export XCODE_PATH="<your Xcode.app path>" # optional, defaults to /Applications/
 Setup commands for exit node:
 ```bash
 sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
-sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
+sudo ./paperflux --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 ```
 
-### 1. Setting up desktop client:
+## Run a desktop client
 
 Setup commands for desktop client:
 ```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
+./paperflux --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
 ```
 
 Then set up SOCKS5 proxy in your browser at localhost:1080.
@@ -111,7 +102,7 @@ Then set up SOCKS5 proxy in your browser at localhost:1080.
 
 ## Implementing custom transports
 
-You are free to implement the `Transport` interface from `transport/transport.go` and register your custom transport in main.go switch block.
+You can implement the `Transport` interface in `transport/transport.go` and register a backend in the transport selector. Keep framing, authentication, and backpressure rules explicit when adding a new backend.
 
 ## License
 
