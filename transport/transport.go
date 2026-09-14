@@ -36,9 +36,9 @@ type TransportStats struct {
 func DefaultConfig() TransportConfig {
 	return TransportConfig{
 		MaxReconnectAttempts: 999999,
-		ReconnectDelay:       0,
+		ReconnectDelay:       time.Second,
 		ReconnectMultiplier:  1.1,
-		MaxQueueSize:         1024,
+		MaxQueueSize:         8192,
 		KeepAliveInterval:    10 * time.Second,
 	}
 }

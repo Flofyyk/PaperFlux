@@ -2,6 +2,21 @@
 
 **English** | [Русский](README.ru.md)
 
+## PaperFlux / Android client
+
+PaperFlux is the Android-facing product built on this transport core. Its profile-driven client and dark Material 3 interface are published separately in [PaperFlux Android](https://github.com/Snappyk222/OpenFluxAndroid).
+
+The Android app supplies its own document profile at runtime. Nothing in this repository is a user's access credential. A session flows from the Android TUN through the Yandex Engine.IO channel to an OpenFlux exit node, which opens the destination connection on the user's behalf.
+
+### Transport path
+
+```text
+Android TUN → native OpenFlux client → Yandex Docs Engine.IO/WebSocket
+           → OpenFlux exit node → TCP destination
+```
+
+The Yandex adapter performs the required polling handshake, WebSocket upgrade, and Socket.IO authorization before data transfer. Packet framing stays compatible with the existing Base64/Socket.IO transport and uses bounded adaptive batches.
+
 Network stack research tool. TCP tunnel with pluggable transports.
 
 ## Overview

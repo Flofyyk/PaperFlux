@@ -7,20 +7,27 @@ import (
 )
 
 func TCPChecksum(tcpData []byte, srcIP, dstIP [4]byte) uint16 {
+	return TransportChecksum(tcpData, srcIP, dstIP, 6)
+}
+
+// TransportChecksum calculates the IPv4 pseudo-header checksum for TCP or UDP.
+// Keeping the protocol byte explicit lets the UDP stream reuse the exact same
+// validation path without changing the existing TCP wire format.
+func TransportChecksum(data []byte, srcIP, dstIP [4]byte, protocol byte) uint16 {
 	pseudoHeader := []byte{
 		srcIP[0], srcIP[1], srcIP[2], srcIP[3],
 		dstIP[0], dstIP[1], dstIP[2], dstIP[3],
-		0, 6,
+		0, protocol,
 		0, 0,
 	}
 
-	tcpLen := len(tcpData)
-	pseudoHeader[10] = byte(tcpLen >> 8)
-	pseudoHeader[11] = byte(tcpLen & 0xff)
+	dataLen := len(data)
+	pseudoHeader[10] = byte(dataLen >> 8)
+	pseudoHeader[11] = byte(dataLen & 0xff)
 
-	all := make([]byte, 0, len(pseudoHeader)+tcpLen)
+	all := make([]byte, 0, len(pseudoHeader)+dataLen)
 	all = append(all, pseudoHeader...)
-	all = append(all, tcpData...)
+	all = append(all, data...)
 
 	sum := uint32(0)
 	for i := 0; i < len(all)-1; i += 2 {

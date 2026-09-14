@@ -2,6 +2,21 @@
 
 [English](README.md) | **Русский**
 
+## PaperFlux / Android-клиент
+
+PaperFlux — Android-клиент поверх этого транспортного ядра. Клиент с профилями и тёмным интерфейсом Material 3 публикуется отдельно в репозитории [PaperFlux Android](https://github.com/Snappyk222/OpenFluxAndroid).
+
+Приложение получает документ и остальные параметры профиля во время импорта. Пользовательские секреты не зашиты в этот репозиторий. Путь сессии: Android TUN → канал Yandex Engine.IO → выходная нода OpenFlux → соединение назначения.
+
+### Путь трафика
+
+```text
+Android TUN → native OpenFlux client → Yandex Docs Engine.IO/WebSocket
+           → OpenFlux exit node → TCP destination
+```
+
+Адаптер Yandex выполняет штатный polling-handshake, WebSocket upgrade и Socket.IO-аутентификацию до передачи данных. Формат кадров остаётся совместимым с Base64/Socket.IO и использует ограниченные адаптивные батчи.
+
 Исследовательский инструмент сетевого стека. TCP-туннель с подключаемыми транспортами.
 
 ## Обзор

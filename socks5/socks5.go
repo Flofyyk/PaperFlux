@@ -16,11 +16,14 @@ type Dialer interface {
 type SOCKS5Server struct {
 	listenAddr string
 	dialer     Dialer
+	ready      chan struct{}
 }
 
 func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
-	return &SOCKS5Server{listenAddr: addr, dialer: dialer}
+	return &SOCKS5Server{listenAddr: addr, dialer: dialer, ready: make(chan struct{})}
 }
+
+func (s *SOCKS5Server) Ready() <-chan struct{} { return s.ready }
 
 func (s *SOCKS5Server) Start() error {
 	listener, err := net.Listen("tcp", s.listenAddr)
@@ -28,6 +31,7 @@ func (s *SOCKS5Server) Start() error {
 		return err
 	}
 	defer listener.Close()
+	close(s.ready)
 
 	utils.Debugf("[SOCKS5] Listening on %s", s.listenAddr)
 

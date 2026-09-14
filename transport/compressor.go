@@ -10,6 +10,10 @@ import (
 const (
 	MinCompressSize   = 200
 	CompressionMarker = 0x1F
+	// TLS/QUIC payloads are already encrypted and practically incompressible.
+	// Avoid creating an LZ4 writer for normal MTU-sized packets; the marker keeps
+	// the wire format backward compatible with older peers.
+	FastPathSize = 4096
 )
 
 type CompressedTransport struct {
@@ -37,11 +41,12 @@ func (c *CompressedTransport) Receive(callback func([]byte)) {
 }
 
 func compress(data []byte) []byte {
-	if len(data) <= MinCompressSize {
-		out := make([]byte, 1, len(data)+1)
-		out[0] = 0x00
-		out = append(out, data...)
-		return out
+	if len(data) <= FastPathSize {
+		// Android TUN packets are normally below the MTU. Adding a marker
+		// here used to allocate and copy every packet even though no LZ4
+		// compression was attempted. The Yandex batch/WebSocket layer handles
+		// framing and compression after packets have been coalesced.
+		return data
 	}
 
 	var buf bytes.Buffer
@@ -68,6 +73,9 @@ func decompress(data []byte) ([]byte, error) {
 
 	if data[0] == 0x00 {
 		return data[1:], nil
+	}
+	if data[0] != CompressionMarker {
+		return data, nil
 	}
 
 	r := lz4.NewReader(bytes.NewReader(data[1:]))
