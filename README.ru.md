@@ -4,7 +4,7 @@
 
 ## PaperFlux / Android-клиент
 
-PaperFlux — Android-клиент поверх этого транспортного ядра. Клиент с профилями и тёмным интерфейсом Material 3 публикуется отдельно в репозитории [PaperFlux Android](https://github.com/Snappyk222/OpenFluxAndroid).
+PaperFlux — Android-клиент поверх этого транспортного ядра. Клиент с профилями и тёмным интерфейсом Material 3 публикуется отдельно в репозитории [PaperFlux Android](https://github.com/Flofyyk/OpenFluxAndroid).
 
 Приложение получает документ и остальные параметры профиля во время импорта. Пользовательские секреты не зашиты в этот репозиторий. Путь сессии: Android TUN → канал Yandex Engine.IO → выходная нода OpenFlux → соединение назначения.
 
