@@ -2,46 +2,36 @@
 
 [Русский](README.md) | **English**
 
-The server component of PaperFlux for a Linux server you administer. It accepts connections from compatible PaperFlux clients and forwards them through an exit node.
+PaperFlux Server is the server component of PaperFlux for a Linux VPS you administer. The exit node accepts connections from compatible clients and forwards traffic to the network.
 
-The Android client is maintained separately: [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
+Android client: [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
 
-## Features
+## Included components
 
-- Linux exit-node mode.
+- Linux exit node.
 - Yandex Docs transport over WebSocket.
 - Profile authentication and encrypted transport messages.
-- Local SOCKS5 listener for desktop-client testing.
-- Android support: TUN descriptor handoff, DNS/TCP checks, and traffic counters.
+- Android client support: TUN handoff, DNS/TCP checks, and traffic counters.
 
-## Requirements
+## Deploy on a VPS
 
-- A Linux server with root access for exit-node mode.
-- Go 1.26.3 or later.
-- Profile data and a document URL created for your deployment.
+The full deployment guide, including systemd configuration and updates, is maintained in the [Russian README](README.md). It uses these steps:
 
-## Build
+1. Install Go 1.26.4 or later and build the binary.
+2. Store the document URL and profile credentials in a root-only environment file.
+3. Run the exit node as a systemd service.
+4. Verify it through `systemctl status paperflux` and `journalctl -u paperflux -f`.
 
-```bash
-go mod tidy
-go build -o paperflux .
-```
+The current exit-node implementation requires root access for raw sockets.
 
-## Run an exit node
+## Main parameters
 
-```bash
-sudo ./paperflux --exit-node --url "YOUR_DOCUMENT_URL"
-```
+- `--exit-node` runs the VPS as an exit node.
+- `--url` sets the Yandex Docs URL.
+- `--profile-id` and `--profile-token` set profile credentials.
+- `--transport yandex` selects the default transport.
 
-## Local test
-
-This starts the client and a SOCKS5 listener on `127.0.0.1:1080`:
-
-```bash
-./paperflux --client --url "YOUR_DOCUMENT_URL" --socks5 :1080
-```
-
-Run `./paperflux --help` for all available parameters.
+Run `paperflux --help` for all options.
 
 ## Documentation
 
