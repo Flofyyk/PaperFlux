@@ -1,44 +1,45 @@
 # PaperFlux Server
 
-[Русский](README.md) | **English**
+[Русский](README.md) · **English** · [Android client](https://github.com/Flofyyk/PaperFluxAndroid)
 
-PaperFlux Server is the server component of PaperFlux for a Linux VPS you administer. The exit node accepts connections from compatible clients and forwards traffic to the network.
+PaperFlux is a TCP tunnel that carries data through Yandex Docs. The client accepts application traffic; a VPS exit node forwards it to the destination and sends responses back through the same channel.
 
-Android client: [PaperFlux Android](https://github.com/Flofyyk/PaperFluxAndroid).
+Based on [OpenFlux](https://github.com/p1neappleXpress/OpenFlux), this repository contains the server and shared PaperFlux transport core.
 
-## Included components
+## How it works
 
-- Linux exit node.
-- Yandex Docs transport over WebSocket.
-- Profile authentication and encrypted transport messages.
-- Android client support: TUN handoff, DNS/TCP checks, and traffic counters.
+```text
+Android apps ↔ VPN/TCP stack ↔ PFS2
+                                 ↕
+                  Yandex Docs collaboration channel
+                                 ↕
+                         VPS ↔ destination
+```
 
-## Deploy on a VPS
+The Android client processes VPN-interface packets through a local network stack. A SOCKS5 entry point is also available for desktop clients.
 
-The full deployment guide, including systemd configuration and updates, is maintained in the [Russian README](README.md). It uses these steps:
+Both endpoints join the same Yandex document. The transport batches and encrypts data, then encodes it inside cursor messages sent through Socket.IO over Engine.IO/WebSocket. Packet content does not need to be written into the document text.
 
-1. Install Go 1.26.4 or later and build the binary.
-2. Store the document URL and profile credentials in a root-only environment file.
-3. Run the exit node as a systemd service.
-4. Verify it through `systemctl status paperflux` and `journalctl -u paperflux -f`.
+The VPS decodes these messages and forwards TCP packets using raw sockets. Responses follow the reverse path.
 
-The current exit-node implementation requires root access for raw sockets.
+## Secure sessions and recovery
 
-## Main parameters
+PFS2 authenticates peers using profile credentials, exchanges keys with X25519 and encrypts messages with AES-256-GCM. Application data is accepted only after session confirmation. Encryption covers the client-to-VPS path; protection beyond the VPS depends on the application's protocol, such as HTTPS.
 
-- `--exit-node` runs the VPS as an exit node.
-- `--url` sets the Yandex Docs URL.
-- `--profile-id` and `--profile-token` set profile credentials.
-- `--transport yandex` selects the default transport.
+The document service can observe message timing and sizes. See [PFS2](docs/SECURITY_PFS2.md) for details.
 
-Run `paperflux --help` for all options.
+Connection readiness requires document authentication, a secure peer session and DNS/TCP verification. After a disconnect, the transport fetches document parameters again and creates a fresh WebSocket session. Retries use exponential delays with jitter; expired queued packets are discarded.
 
-## Documentation
+## Compatibility and documentation
 
-- [Android client connection](docs/PAPERFLUX.md)
-- [PFS2 details](docs/SECURITY_PFS2.md)
-- [GPL-3.0-or-later license](LICENSE)
+The primary configuration is PaperFlux Android with a compatible PaperFlux server over Yandex Docs. The current path targets IPv4/TCP; general UDP and IPv6 support are not advertised.
 
-## Use
+- [Linux VPS deployment](docs/DEPLOYMENT.md) (Russian)
+- [Android profiles and connection](docs/PAPERFLUX.md) (Russian)
+- [PFS2 protocol](docs/SECURITY_PFS2.md) (Russian)
 
-Use PaperFlux only for education, research, and testing on systems you own or are explicitly authorized to use. You are responsible for your server, access, data, and traffic.
+## License and use
+
+[GPL-3.0-or-later](LICENSE); third-party notices are in [NOTICE](NOTICE).
+
+For education and research on systems you own or are authorized to use. Provided as is, without warranties. Users are responsible for their deployments and use.

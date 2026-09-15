@@ -402,6 +402,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				if !current {
 					return
 				}
+				// Close the broken socket immediately instead of waiting for the
+				// next connection attempt to retire it (upstream #55).
+				session.retire()
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				log.Printf("[PAPERFLUX] Yandex transport lost after %s: %v", time.Since(attemptStarted).Round(time.Millisecond), err)
 				t.SetConnected(false)
@@ -1100,10 +1103,12 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	_ = attempt // Attempts are tracked centrally so concurrent failures coalesce.
 	failed := t.failedAttempts.Add(1)
 	base := t.GetConfig().ReconnectDelay
-	if base <= 0 {
-		base = time.Second
+	if base < 1500*time.Millisecond {
+		base = 1500 * time.Millisecond
 	}
-	// 1, 2, 4, ... seconds, capped at two minutes.  A small positive jitter
+	// Respect upstream #55's minimum retry interval to reduce document-room
+	// participant churn. Preserve our longer cap and CAPTCHA cooldown.
+	// Exponential delay is capped at two minutes. A small positive jitter
 	// keeps client and exit-node retries from becoming synchronized.
 	shift := min(int(failed-1), 6)
 	delay := base * time.Duration(1<<shift)
