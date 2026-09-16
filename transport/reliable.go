@@ -16,13 +16,16 @@ import (
 // The enclosing Yandex/PFS2 transport authenticates every control and data
 // frame; this layer supplies delivery identity and bounded retry semantics.
 const (
-	reliableMagic           = "PFR1"
-	reliableHeaderSize      = 4 + 1 + 8 + 8
-	reliableHello      byte = 1
-	reliableAck        byte = 2
-	reliableData       byte = 3
-	reliableMaxPending      = 512
-	reliableMaxBytes        = 4 << 20
+	reliableMagic                 = "PFR1"
+	reliableHeaderSize            = 4 + 1 + 8 + 8
+	reliableHello            byte = 1
+	reliableAck              byte = 2
+	reliableData             byte = 3
+	reliableMaxPending            = 256
+	reliableMaxBytes              = 2 << 20
+	reliableSoftPending           = 192
+	reliableSoftBytes             = 1 << 20
+	reliableBackpressureWait      = 120 * time.Millisecond
 )
 
 type ReliableTransport struct {
@@ -45,6 +48,7 @@ type ReliableTransport struct {
 	drops     atomic.Uint64
 	stop      chan struct{}
 	stopOnce  sync.Once
+	spaceCh   chan struct{}
 }
 
 type reliablePending struct {
@@ -67,6 +71,7 @@ func NewReliableTransport(inner Transport, config TransportConfig) (*ReliableTra
 		pending:       make(map[uint64]*reliablePending),
 		seen:          make(map[reliableKey]time.Time),
 		stop:          make(chan struct{}),
+		spaceCh:       make(chan struct{}),
 		rto:           time.Second,
 	}, nil
 }
@@ -91,22 +96,40 @@ func (t *ReliableTransport) Stop() error {
 	clear(t.pending)
 	clear(t.seen)
 	t.pendingN, t.pendingB = 0, 0
+	t.signalSpaceLocked()
 	t.mu.Unlock()
 	return t.Transport.Stop()
 }
 
 func (t *ReliableTransport) Send(packet []byte) error {
-	t.mu.Lock()
-	ready := t.ready
-	if !ready || t.pendingN >= reliableMaxPending || t.pendingB+uint64(len(packet)) > reliableMaxBytes {
-		if ready && (t.pendingN >= reliableMaxPending || t.pendingB+uint64(len(packet)) > reliableMaxBytes) {
-			t.drops.Add(1)
+	deadline := time.Now().Add(reliableBackpressureWait)
+	for {
+		t.mu.Lock()
+		ready := t.ready
+		full := t.pendingN >= reliableMaxPending || t.pendingB+uint64(len(packet)) > reliableMaxBytes
+		softFull := t.pendingN >= reliableSoftPending || t.pendingB+uint64(len(packet)) > reliableSoftBytes
+		if !ready {
+			t.mu.Unlock()
+			return t.Transport.Send(packet)
 		}
+		if !full && !softFull {
+			break
+		}
+		waitCh := t.spaceCh
 		t.mu.Unlock()
-		if ready {
-			return fmt.Errorf("reliable pending window full")
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.drops.Add(1)
+			return fmt.Errorf("reliable pending window backpressure")
 		}
-		return t.Transport.Send(packet)
+		timer := time.NewTimer(min(remaining, 10*time.Millisecond))
+		select {
+		case <-waitCh:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
 	}
 	t.sequence++
 	seq := t.sequence
@@ -121,6 +144,7 @@ func (t *ReliableTransport) Send(packet []byte) error {
 			delete(t.pending, seq)
 			t.pendingN--
 			t.pendingB -= uint64(len(entry.frame) - reliableHeaderSize)
+			t.signalSpaceLocked()
 		}
 		t.mu.Unlock()
 		return err
@@ -172,6 +196,7 @@ func (t *ReliableTransport) handleReceive(frame []byte) {
 				delete(t.pending, sequence)
 				t.pendingN--
 				t.pendingB -= uint64(len(entry.frame) - reliableHeaderSize)
+				t.signalSpaceLocked()
 			}
 		}
 		t.mu.Unlock()
@@ -232,6 +257,7 @@ func (t *ReliableTransport) controlLoop() {
 					t.pendingN--
 					t.pendingB -= uint64(len(entry.frame) - reliableHeaderSize)
 					t.drops.Add(1)
+					t.signalSpaceLocked()
 					continue
 				}
 				entry.attempt++
@@ -254,6 +280,13 @@ func (t *ReliableTransport) controlLoop() {
 			}
 		}
 	}
+}
+
+// signalSpaceLocked wakes producers waiting for ACK window capacity. The
+// channel is replaced under the same mutex so a wakeup cannot be lost.
+func (t *ReliableTransport) signalSpaceLocked() {
+	close(t.spaceCh)
+	t.spaceCh = make(chan struct{})
 }
 
 func reliableFrame(kind byte, session, sequence uint64, payload []byte) []byte {

@@ -33,6 +33,10 @@ type flowBinding struct {
 	seenAt time.Time
 }
 
+type queueLoadReporter interface {
+	QueueLoad() float64
+}
+
 func NewMultiTransport(lanes []Transport, config TransportConfig) *MultiTransport {
 	return &MultiTransport{BaseTransport: NewBaseTransport(config), lanes: lanes, flowLanes: make(map[string]flowBinding), activeFlows: make([]uint64, len(lanes))}
 }
@@ -198,6 +202,11 @@ func (m *MultiTransport) Send(packet []byte) error {
 	for offset := 0; offset < len(m.lanes); offset++ {
 		lane := m.lanes[(start+offset)%len(m.lanes)]
 		if !lane.IsConnected() {
+			continue
+		}
+		// Keep headroom on each lane. If another document is ready, a new flow
+		// should use it instead of waiting for a nearly full writer queue.
+		if load, ok := lane.(queueLoadReporter); ok && load.QueueLoad() >= 0.75 {
 			continue
 		}
 		if err := lane.Send(packet); err == nil {

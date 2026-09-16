@@ -132,6 +132,8 @@ type pendingProof struct {
 var yandexFramePool = sync.Pool{New: func() interface{} { return make([]byte, 0, 4096) }}
 
 const batchMaxPayload = 32 << 10
+const batchMinPayload = 8 << 10
+const maxLaneQueuePackets = 2048
 const batchCoalesceDelay = 500 * time.Microsecond
 const maxQueuedPacketAge = 12 * time.Second
 const maxPendingProofs = 8
@@ -254,6 +256,13 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 
 	if session == nil {
 		return fmt.Errorf("transport has no session yet")
+	}
+	// Leave headroom for control frames and give MultiTransport a chance to
+	// move new flows to another document lane before this queue is exhausted.
+	// Waiting until the channel is completely full caused a burst to block the
+	// writer for 250 ms and then produce a synchronized reconnect storm.
+	if cap(session.WriteQueue) > 0 && len(session.WriteQueue) >= cap(session.WriteQueue)*3/4 {
+		return fmt.Errorf("write queue backpressure")
 	}
 
 	// Keep a bounded amount of TUN traffic while an authenticated session is
@@ -424,7 +433,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		}
 		log.Printf("[PAPERFLUX] Engine.IO upgrade ready in %s", time.Since(attemptStarted).Round(time.Millisecond))
 
-		writeQueue := make(chan queuedPacket, t.GetConfig().MaxQueueSize)
+		queueSize := min(t.GetConfig().MaxQueueSize, maxLaneQueuePackets)
+		writeQueue := make(chan queuedPacket, queueSize)
 		if existingSession != nil {
 			writeQueue = existingSession.WriteQueue
 		}
@@ -823,6 +833,7 @@ func (t *YandexDocsTransport) writerLoop() {
 			payload := yandexBatchPool.Get().([]byte)
 			payload = payload[:0]
 			payload = append(payload, batchMagic...)
+			payloadLimit := t.batchPayloadLimit(session)
 			appendPacket := func(item queuedPacket) bool {
 				p := item.data
 				if len(p) > 0xffff {
@@ -830,7 +841,7 @@ func (t *YandexDocsTransport) writerLoop() {
 				}
 				// Never drop the first packet solely because it is larger than the
 				// coalescing target; the target is a batching hint, not a frame cap.
-				if len(payload) > len(batchMagic) && len(payload)+2+len(p) > batchMaxPayload {
+				if len(payload) > len(batchMagic) && len(payload)+2+len(p) > payloadLimit {
 					return false
 				}
 				var n [2]byte
@@ -864,7 +875,7 @@ func (t *YandexDocsTransport) writerLoop() {
 				batchTimer := time.NewTimer(batchCoalesceDelay)
 				batchTimerActive := true
 			batchLoop:
-				for len(payload) < batchMaxPayload {
+				for len(payload) < payloadLimit {
 					select {
 					case next := <-session.WriteQueue:
 						if time.Since(next.queuedAt) > maxQueuedPacketAge || len(next.data) > 0xffff {
@@ -942,6 +953,33 @@ func (t *YandexDocsTransport) writerLoop() {
 				yandexBatchPool.Put(payload[:0])
 			}
 		}
+	}
+}
+
+// QueueLoad is used by MultiTransport to avoid assigning new flows to a lane
+// that is already under pressure. Existing flows keep their lane for ordering.
+func (t *YandexDocsTransport) QueueLoad() float64 {
+	t.Mu.RLock()
+	session := t.session
+	t.Mu.RUnlock()
+	if session == nil || cap(session.WriteQueue) == 0 {
+		return 0
+	}
+	return float64(len(session.WriteQueue)) / float64(cap(session.WriteQueue))
+}
+
+func (t *YandexDocsTransport) batchPayloadLimit(session *DocSession) int {
+	if session == nil || cap(session.WriteQueue) == 0 {
+		return batchMaxPayload
+	}
+	load := float64(len(session.WriteQueue)) / float64(cap(session.WriteQueue))
+	switch {
+	case load >= 0.75:
+		return batchMinPayload
+	case load >= 0.50:
+		return (batchMaxPayload + batchMinPayload) / 2
+	default:
+		return batchMaxPayload
 	}
 }
 
