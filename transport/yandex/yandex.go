@@ -54,6 +54,9 @@ type DocSession struct {
 	pingMs       atomic.Int64
 	lastPing     atomic.Int64
 	lastActivity atomic.Int64
+	// Set for an editor-requested rotation. Its subsequent ReadMessage error
+	// is expected, so it must not be treated as a second failure.
+	expectedClose atomic.Bool
 }
 
 // queuedPacket carries its enqueue timestamp so reconnects never replay old
@@ -512,6 +515,10 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				current := t.session == session
 				t.Mu.RUnlock()
 				if !current {
+					return
+				}
+				if session.expectedClose.Load() {
+					log.Printf("[PAPERFLUX] Yandex document session rotated after %s", time.Since(attemptStarted).Round(time.Millisecond))
 					return
 				}
 				// Close the broken socket immediately instead of waiting for the
@@ -1098,6 +1105,21 @@ func enginePollingURL(wsURL string) (string, error) {
 
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
+	if reason, ok := disconnectReasonSummary(data); ok {
+		// Yandex may send disconnectReason (most commonly 4007/drop) before
+		// closing the WebSocket.  Do not leave the old session around waiting
+		// for a read timeout: that keeps the VPN looking connected and lets
+		// queued writes target a socket which the editor has already retired.
+		log.Printf("[PAPERFLUX] Yandex requested session close: %s", reason)
+		t.SetConnected(false)
+		t.peerReady.Store(false)
+		if session != nil && t.isCurrentSession(session) {
+			session.expectedClose.Store(true)
+			session.retire()
+			t.scheduleRotationReconnect()
+		}
+		return
+	}
 	if strings.Contains(text, `"type":"waitAuth"`) && !t.IsConnected() {
 		// OnlyOffice emits waitAuth when a document is already being opened by
 		// the peer.  The WebSocket is live and it continues to relay cursor
@@ -1106,6 +1128,9 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		// service still exposes the VPN only after the separate encrypted peer and
 		// DNS/TCP checks succeed.
 		t.SetConnected(true)
+		// waitAuth is already a live editor session. Do not let a later normal
+		// 4007/drop inherit a backoff accumulated before this connection.
+		t.failedAttempts.Store(0)
 		log.Printf("[PAPERFLUX] YANDEX_WAIT_AUTH: editor session is live; awaiting collaborative lock")
 		t.startSecureSession(session, true)
 		return
@@ -1251,6 +1276,56 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 }
 
+// disconnectReasonSummary extracts only the small diagnostic fields from an
+// editor disconnect frame.  The full frame can contain document metadata and
+// must never be copied to logs.
+func disconnectReasonSummary(message []byte) (string, bool) {
+	if !bytes.HasPrefix(message, []byte("42")) {
+		return "", false
+	}
+	var event []json.RawMessage
+	if json.Unmarshal(message[2:], &event) != nil || len(event) < 2 {
+		return "", false
+	}
+	var eventName string
+	if json.Unmarshal(event[0], &eventName) != nil || eventName != "message" {
+		return "", false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(event[1], &payload) != nil {
+		return "", false
+	}
+	var eventType string
+	if raw, ok := payload["type"]; !ok || json.Unmarshal(raw, &eventType) != nil || eventType != "disconnectReason" {
+		return "", false
+	}
+	var code interface{}
+	if raw, ok := payload["code"]; ok {
+		var numeric int
+		if json.Unmarshal(raw, &numeric) == nil {
+			code = numeric
+		} else {
+			var text string
+			if json.Unmarshal(raw, &text) == nil {
+				code = text
+			}
+		}
+	}
+	var description string
+	for _, key := range []string{"description", "message"} {
+		if raw, ok := payload[key]; ok && json.Unmarshal(raw, &description) == nil && description != "" {
+			break
+		}
+	}
+	if code != nil && description != "" {
+		return fmt.Sprintf("code=%v description=%q", code, description), true
+	}
+	if code != nil {
+		return fmt.Sprintf("code=%v", code), true
+	}
+	return "disconnectReason", true
+}
+
 func editorErrorSummary(message []byte) string {
 	if !bytes.HasPrefix(message, []byte("42")) {
 		return "unrecognised error frame"
@@ -1380,6 +1455,26 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	if until := time.Unix(0, t.captchaUntil.Load()); until.After(time.Now()) {
 		delay = time.Until(until)
 	}
+	time.AfterFunc(delay, func() {
+		t.reconnectPending.Store(false)
+		if !t.IsRunning() || t.generation.Load() != generation {
+			return
+		}
+		t.connectToDoc(0)
+	})
+}
+
+// scheduleRotationReconnect is reserved for the editor's explicit 4007/drop
+// rotation.  This is not a failed dial: the old participant is being retired
+// by Yandex, and retrying with a fresh user ID after a short settling window
+// avoids both a long outage and an immediate ghost-participant collision.
+func (t *YandexDocsTransport) scheduleRotationReconnect() {
+	if !t.IsRunning() || !t.reconnectPending.CompareAndSwap(false, true) {
+		return
+	}
+	generation := t.generation.Load()
+	t.failedAttempts.Store(0)
+	delay := 1500*time.Millisecond + time.Duration(rand.Int63n(int64(500*time.Millisecond)))
 	time.AfterFunc(delay, func() {
 		t.reconnectPending.Store(false)
 		if !t.IsRunning() || t.generation.Load() != generation {
