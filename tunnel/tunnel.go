@@ -3,7 +3,9 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,16 +16,47 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
 )
+
+// ExitMode chooses how the VPS delivers TCP to the destination. Raw preserves
+// the historical packet-forwarding path; proxy terminates each TCP flow in
+// gVisor and opens a regular outbound socket, so it needs no raw socket or
+// iptables RST rule.
+type ExitMode uint8
+
+const (
+	ExitModeRaw ExitMode = iota
+	ExitModeProxy
+)
+
+func (m ExitMode) String() string {
+	if m == ExitModeProxy {
+		return "proxy"
+	}
+	return "raw"
+}
+
+func ParseExitMode(value string) (ExitMode, error) {
+	switch value {
+	case "", "raw":
+		return ExitModeRaw, nil
+	case "proxy":
+		return ExitModeProxy, nil
+	default:
+		return ExitModeRaw, fmt.Errorf("unknown exit mode %q (want raw or proxy)", value)
+	}
+}
 
 type TCPTunnel struct {
 	gvisorStack  *stack.Stack
 	tunnelEP     *TunnelLinkEndpoint
 	transport    transport.Transport
 	isExitNode   bool
+	exitMode     ExitMode
 	clientIP     [4]byte
 	rawEP        *RawSocketEndpoint
 	startTime    time.Time
@@ -31,6 +64,7 @@ type TCPTunnel struct {
 	outboundQ    chan []byte
 	outboundDrop atomic.Uint64
 	outboundErr  atomic.Uint64
+	proxyFlows   chan struct{}
 }
 
 func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
@@ -40,10 +74,15 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 // NewTCPTunnelWithClientIP lets isolated Android workers use different
 // virtual addresses. This keeps independently created five-tuples distinct.
 func NewTCPTunnelWithClientIP(trans transport.Transport, isExitNode bool, clientIP [4]byte) *TCPTunnel {
+	return NewTCPTunnelWithClientIPMode(trans, isExitNode, clientIP, ExitModeRaw)
+}
+
+func NewTCPTunnelWithClientIPMode(trans transport.Transport, isExitNode bool, clientIP [4]byte, exitMode ExitMode) *TCPTunnel {
 	t := &TCPTunnel{
 		transport:  trans,
 		isExitNode: isExitNode,
 		clientIP:   clientIP,
+		exitMode:   exitMode,
 		startTime:  time.Now(),
 	}
 
@@ -90,7 +129,11 @@ func NewTCPTunnelWithClientIP(trans transport.Transport, isExitNode bool, client
 	}
 
 	if isExitNode {
-		t.setupExitNode(tunnelNIC)
+		if exitMode == ExitModeProxy {
+			t.setupExitNodeProxy(tunnelNIC)
+		} else {
+			t.setupExitNodeRaw(tunnelNIC)
+		}
 	} else {
 		t.setupClient(tunnelNIC)
 	}
@@ -103,7 +146,7 @@ func NewTCPTunnelWithClientIP(trans transport.Transport, isExitNode bool, client
 	return t
 }
 
-func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
+func (t *TCPTunnel) setupExitNodeRaw(tunnelNIC tcpip.NICID) {
 	localIP := getLocalIP()
 	utils.Debugf("[TUNNEL] EXIT NODE - Local IP: %s", localIP)
 
@@ -166,6 +209,78 @@ func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
 		Destination: tunnelSubnet,
 		NIC:         tunnelNIC,
 	})
+}
+
+const maxProxyFlows = 1024
+
+func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
+	utils.Debugf("[TUNNEL] EXIT NODE - proxy mode")
+	t.gvisorStack.SetPromiscuousMode(tunnelNIC, true)
+	t.gvisorStack.SetSpoofing(tunnelNIC, true)
+	t.gvisorStack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: tunnelNIC})
+	t.proxyFlows = make(chan struct{}, maxProxyFlows)
+	fwd := tcp.NewForwarder(t.gvisorStack, 0, maxProxyFlows, t.handleProxyTCP)
+	t.gvisorStack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+}
+
+func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
+	id := request.ID()
+	destination := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+	select {
+	case t.proxyFlows <- struct{}{}:
+	default:
+		utils.Debugf("[EXIT] proxy flow limit reached for %s", destination)
+		request.Complete(true)
+		return
+	}
+
+	var waitQueue waiter.Queue
+	endpoint, tcpErr := request.CreateEndpoint(&waitQueue)
+	if tcpErr != nil {
+		<-t.proxyFlows
+		utils.Debugf("[EXIT] CreateEndpoint %s: %v", destination, tcpErr)
+		request.Complete(true)
+		return
+	}
+	request.Complete(false)
+	local := gonet.NewTCPConn(&waitQueue, endpoint)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				utils.Debugf("[EXIT] proxy flow panic for %s: %v", destination, recovered)
+			}
+		}()
+		defer func() { <-t.proxyFlows }()
+		defer local.Close()
+		dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		remote, err := dialer.Dial("tcp", destination)
+		if err != nil {
+			utils.Debugf("[EXIT] proxy dial %s failed: %v", destination, err)
+			return
+		}
+		defer remote.Close()
+		if tcpConn, ok := remote.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+		}
+		copyBothWays(local, remote)
+	}()
+}
+
+type closeWriter interface{ CloseWrite() error }
+
+func copyBothWays(left, right net.Conn) {
+	var wait sync.WaitGroup
+	copyDirection := func(destination, source net.Conn) {
+		defer wait.Done()
+		_, _ = io.CopyBuffer(destination, source, make([]byte, 64<<10))
+		if closer, ok := destination.(closeWriter); ok {
+			_ = closer.CloseWrite()
+		}
+	}
+	wait.Add(2)
+	go copyDirection(right, left)
+	go copyDirection(left, right)
+	wait.Wait()
 }
 
 func (t *TCPTunnel) drainOutbound() {

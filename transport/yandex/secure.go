@@ -151,7 +151,29 @@ func (c *secureChannel) receiveHandshake(b []byte) ([]byte, error) {
 		ack := c.header(2)
 		return append(ack, c.mac(ack)...), nil
 	case 2:
-		if !c.havePeer || remote != c.peer || !bytes.Equal(b[38:70], c.local[:]) {
+		// A peer may receive our HELLO before its own editor authentication is
+		// fully promoted and therefore reply with an ACK without first sending a
+		// HELLO of its own.  The old code rejected that valid first response
+		// because it expected c.havePeer to have been set by an earlier HELLO,
+		// leaving both sides in a permanent handshake loop.  The ACK binds the
+		// sender's key to our local key and is MAC-authenticated, so it is safe to
+		// establish the peer identity from it.
+		if !bytes.Equal(b[38:70], c.local[:]) || remote == ([32]byte{}) || c.retired[remote] {
+			return nil, errSecure
+		}
+		if !c.havePeer {
+			c.peer = remote
+			c.havePeer = true
+			c.high = 0
+			c.bitmap = 0
+			c.seen = false
+			if err := c.keys(); err != nil {
+				c.havePeer = false
+				c.send = nil
+				c.recv = nil
+				return nil, err
+			}
+		} else if remote != c.peer {
 			return nil, errSecure
 		}
 		c.confirmed = true

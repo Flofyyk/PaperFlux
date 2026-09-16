@@ -29,6 +29,11 @@ type TransportStats struct {
 	PacketsSent   uint64
 	PacketsRecv   uint64
 	Reconnects    uint64
+	RetryQueued   uint64
+	ExpiredDrops  uint64
+	QueuePackets  uint64
+	QueueBytes    uint64
+	WriteFailures uint64
 	Connected     bool
 	Uptime        time.Duration
 }

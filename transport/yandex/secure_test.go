@@ -87,6 +87,43 @@ func TestSecureRequiresHandshake(t *testing.T) {
 	}
 }
 
+func TestSecureAcceptsAckWithoutPriorPeerHello(t *testing.T) {
+	client, err := newSecureChannel("42", "0123456789abcdef0123456789abcdef", "doc", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit, err := newSecureChannel("42", "0123456789abcdef0123456789abcdef", "doc", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := client.receiveHandshake(exit.hello())
+	if err != nil || ack == nil {
+		t.Fatalf("client should accept the first hello: ack=%v err=%v", ack != nil, err)
+	}
+	if _, err = exit.receiveHandshake(ack); err != nil {
+		t.Fatalf("exit should accept an authenticated ACK without a prior peer hello: %v", err)
+	}
+	// The client still completes its side with its own HELLO, as it does after
+	// leaving the editor's waitAuth state.
+	clientAck, err := exit.receiveHandshake(client.hello())
+	if err != nil || clientAck == nil {
+		t.Fatalf("exit should acknowledge the client's hello: ack=%v err=%v", clientAck != nil, err)
+	}
+	if _, err = client.receiveHandshake(clientAck); err != nil {
+		t.Fatalf("client should accept the completing ACK: %v", err)
+	}
+	if !client.ready() || !exit.ready() {
+		t.Fatal("channels did not become ready")
+	}
+	frame, err := exit.seal([]byte("probe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, err := client.open(frame); err != nil || !bytes.Equal(plain, []byte("probe")) {
+		t.Fatalf("ack-only handshake did not establish usable keys: %q %v", plain, err)
+	}
+}
+
 func TestSecureOutOfOrderAndContextIsolation(t *testing.T) {
 	a, b := pair(t)
 	frames := make([][]byte, 70)

@@ -30,13 +30,14 @@ func main() {
 	//os.Setenv("GODEBUG", "netdns=go")
 	fmt.Print("written by p1neappleXpress\n")
 
-	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
+	exitNode := flag.Bool("exit-node", false, "Run as exit node")
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	tunFdSock := flag.String("tun-fd-sock", "", "abstract Unix socket for an Android VpnService TUN descriptor")
 	packetSock := flag.String("packet-sock", "", "TCP packet bridge address for isolated Android worker")
 	clientIPFlag := flag.String("client-ip", "10.10.10.2", "Virtual IPv4 address for this Android worker")
+	exitModeFlag := flag.String("mode", "raw", "Exit-node mode: raw or proxy")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
 	documentURLs := flag.String("urls", "", "Comma-separated Yandex Docs URLs for parallel document lanes")
 	relayURL := flag.String("relay-url", "", "V2 relay WebSocket URL")
@@ -57,6 +58,10 @@ func main() {
 
 	if *debug {
 		utils.EnableDebug()
+	}
+	exitMode, err := tunnel.ParseExitMode(*exitModeFlag)
+	if err != nil {
+		log.Fatalf("--mode: %v", err)
 	}
 	clientIP := [4]byte{10, 10, 10, 2}
 	if parsed := net.ParseIP(*clientIPFlag).To4(); parsed != nil {
@@ -105,7 +110,22 @@ func main() {
 		if len(lanes) == 1 {
 			trans = lanes[0]
 		} else {
+			// A multi transport emits one aggregate statistics stream.  Suppress
+			// independent lane streams: their counter resets cannot be interpreted
+			// correctly by a single Android VPN notification.
+			for _, lane := range lanes {
+				if yandexLane, ok := lane.(*yandex.YandexDocsTransport); ok {
+					yandexLane.SetStatsLogging(false)
+				}
+			}
 			trans = transport.NewMultiTransport(lanes, config)
+			// The wrapper begins in legacy pass-through mode and enables ACK/retry
+			// only after the peer advertises the same capability.
+			reliable, err := transport.NewReliableTransport(trans, config)
+			if err != nil {
+				log.Fatalf("Configure reliable multi-transport: %v", err)
+			}
+			trans = reliable
 			log.Printf("Yandex parallel document lanes: %d", len(lanes))
 		}
 	case "oneme":
@@ -188,11 +208,13 @@ func main() {
 		return
 	}
 
-	tun := tunnel.NewTCPTunnelWithClientIP(trans, *exitNode, clientIP)
+	tun := tunnel.NewTCPTunnelWithClientIPMode(trans, *exitNode, clientIP, exitMode)
 
 	if *exitNode {
-		log.Printf("Running as EXIT NODE (needs root for raw socket)")
-		log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+		log.Printf("Running as EXIT NODE (%s mode)", exitMode)
+		if exitMode == tunnel.ExitModeRaw {
+			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+		}
 		select {}
 	} else {
 		log.Printf("Running as CLIENT (SOCKS5 on %s)", *socksAddr)

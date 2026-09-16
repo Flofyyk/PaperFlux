@@ -2,7 +2,7 @@
 
 [← Принцип работы](../README.md)
 
-Ниже пример для чистого Ubuntu/Debian VPS. Exit-node запускается от root: это требуется текущей реализации для работы с raw sockets.
+Ниже пример для чистого Ubuntu/Debian VPS. Рекомендуемый режим `proxy` не использует raw sockets, не меняет правила firewall и запускается от отдельного системного пользователя. Режим `raw` оставлен для совместимости с пакетным выходом.
 
 ### 1. Подготовьте сервер
 
@@ -21,10 +21,11 @@ sudo install -m 0755 paperflux /usr/local/bin/paperflux
 
 ### 2. Создайте файл конфигурации
 
-Храните параметры сервиса в отдельном файле с доступом только root. Текущий CLI получает их через аргументы запуска: systemd подставляет значения из файла, поэтому они всё равно могут быть видны в списке процессов. Этот файл упрощает настройку, но не является механизмом сокрытия аргументов.
+Храните параметры сервиса в отдельном файле с доступом только владельцу сервиса. Текущий CLI получает их через аргументы запуска: systemd подставляет значения из файла, поэтому они всё равно могут быть видны в списке процессов. Этот файл упрощает настройку, но не является механизмом сокрытия аргументов.
 
 ```bash
-sudo install -d -m 0700 /etc/paperflux
+sudo useradd --system --home /var/lib/paperflux --shell /usr/sbin/nologin paperflux
+sudo install -d -o paperflux -g paperflux -m 0700 /etc/paperflux
 sudo nano /etc/paperflux/paperflux.env
 ```
 
@@ -37,6 +38,7 @@ PAPERFLUX_PROFILE_TOKEN=replace-with-profile-token
 Ограничьте доступ:
 
 ```bash
+sudo chown paperflux:paperflux /etc/paperflux/paperflux.env
 sudo chmod 600 /etc/paperflux/paperflux.env
 ```
 
@@ -54,9 +56,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=paperflux
 EnvironmentFile=/etc/paperflux/paperflux.env
-ExecStart=/usr/local/bin/paperflux --exit-node --transport yandex --url ${PAPERFLUX_DOCUMENT_URL} --profile-id ${PAPERFLUX_PROFILE_ID} --profile-token ${PAPERFLUX_PROFILE_TOKEN}
+ExecStart=/usr/local/bin/paperflux --exit-node --mode proxy --transport yandex --url ${PAPERFLUX_DOCUMENT_URL} --profile-id ${PAPERFLUX_PROFILE_ID} --profile-token ${PAPERFLUX_PROFILE_TOKEN}
 Restart=on-failure
 RestartSec=5
 
@@ -64,7 +66,9 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Текущий режим exit-node использует raw sockets. Правило ниже подавляет исходящие TCP RST на всём сервере, а не только для PaperFlux. Используйте выделенный VPS: такое правило затрагивает другие TCP-сервисы.
+`proxy` — режим по умолчанию в этой инструкции. Он ограничивает одновременные TCP-потоки и открывает обычные исходящие соединения от VPS; root и iptables не нужны.
+
+Если требуется старый пакетный режим, замените `--mode proxy` на `--mode raw`, установите `User=root` и добавьте правило ниже. Оно подавляет исходящие TCP RST на всём сервере, а не только для PaperFlux, поэтому используйте выделенный VPS.
 
 ```bash
 sudo iptables -C OUTPUT -p tcp --tcp-flags RST RST -j DROP || \
@@ -87,7 +91,7 @@ sudo journalctl -u paperflux -f
 
 В журнале должен появиться запуск exit-node и подключение транспорта. Не публикуйте вывод журнала без удаления ссылок, токенов и адресов.
 
-Для удаления добавленного правила RST выполните:
+Для удаления правила RST в raw-режиме выполните:
 
 ```bash
 sudo iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP
@@ -112,7 +116,9 @@ sudo systemctl status paperflux
 
 - `--exit-node` — запуск VPS как выходного узла.
 - `--url` — ссылка на Yandex Docs.
+- `--urls` — одна или две ссылки на Yandex Docs через запятую; включает резервирование и распределение новых TCP-потоков.
 - `--profile-id` и `--profile-token` — данные профиля.
+- `--mode proxy|raw` — способ выхода VPS в интернет.
 - `--transport yandex` — транспорт по умолчанию.
 
 Полный список доступен через `paperflux --help`.

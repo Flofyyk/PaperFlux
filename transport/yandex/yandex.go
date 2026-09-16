@@ -16,6 +16,7 @@ import (
 	"net/http/cookiejar"
 	urlpkg "net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,7 @@ type DocSession struct {
 	retireOnce   sync.Once
 	writeMu      sync.Mutex
 	diagFrames   atomic.Uint32
+	diagSecure   atomic.Uint32
 	pingMs       atomic.Int64
 	lastPing     atomic.Int64
 	lastActivity atomic.Int64
@@ -104,6 +106,22 @@ type YandexDocsTransport struct {
 	generation       atomic.Uint64
 	failedAttempts   atomic.Int32
 	captchaUntil     atomic.Int64
+
+	// retryQueue owns batches that a writer had already removed from the
+	// session queue when its WebSocket write failed.  Keeping this outside a
+	// DocSession lets a replacement session continue the same bounded backlog.
+	// queuedAt is never reset: a reconnect must not resurrect stale TCP data.
+	queueMu       sync.Mutex
+	retryQueue    []queuedPacket
+	retryQueued   atomic.Uint64
+	expiredDrops  atomic.Uint64
+	writeFailures atomic.Uint64
+	queuedBytes   atomic.Uint64
+	queuedPackets atomic.Uint64
+	// Android consumes one statistics stream for a tunnel.  A multi-document
+	// tunnel therefore disables per-lane reporting and reports its aggregate
+	// from MultiTransport instead.
+	statsLogging atomic.Bool
 }
 
 type pendingProof struct {
@@ -146,8 +164,13 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig, identi
 	t.baseUserID = randUserID()
 	t.failedAttempts.Store(0)
 	t.captchaUntil.Store(0)
+	t.statsLogging.Store(true)
 	return t
 }
+
+// SetStatsLogging controls only the local PAPERFLUX_STATS diagnostic line.
+// It never affects transport traffic or counters.
+func (t *YandexDocsTransport) SetStatsLogging(enabled bool) { t.statsLogging.Store(enabled) }
 
 func (t *YandexDocsTransport) Start() error {
 	t.generation.Add(1)
@@ -165,7 +188,9 @@ func (t *YandexDocsTransport) Start() error {
 	// session after ~30 seconds unless the editor channel itself sees activity.
 	// This marker is ignored by handleMessage and carries no user data.
 	go t.keepAliveLoop()
-	go t.statsLoop()
+	if t.statsLogging.Load() {
+		go t.statsLoop()
+	}
 	t.connectToDoc(0)
 
 	return nil
@@ -183,6 +208,9 @@ func (t *YandexDocsTransport) Stop() error {
 	t.proofMu.Lock()
 	clear(t.pendingProof)
 	t.proofMu.Unlock()
+	t.queueMu.Lock()
+	t.retryQueue = nil
+	t.queueMu.Unlock()
 	t.Mu.Lock()
 	session := t.session
 	t.session = nil
@@ -236,6 +264,8 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	// below preserves backpressure if the transport is genuinely stalled.
 	select {
 	case session.WriteQueue <- queuedPacket{data: data, queuedAt: time.Now()}:
+		t.queuedPackets.Add(1)
+		t.queuedBytes.Add(uint64(len(data)))
 		session.lastActivity.Store(time.Now().UnixNano())
 		t.RecordSend(len(data))
 		return nil
@@ -247,11 +277,77 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	defer timer.Stop()
 	select {
 	case session.WriteQueue <- queuedPacket{data: data, queuedAt: time.Now()}:
+		t.queuedPackets.Add(1)
+		t.queuedBytes.Add(uint64(len(data)))
 		t.RecordSend(len(data))
 		return nil
 	case <-timer.C:
 		return fmt.Errorf("write queue blocked")
 	}
+}
+
+// takeRetryBatch gives the writer the batch that failed most recently before
+// it reads newer work.  It deliberately does not copy packet data; ownership
+// remains in the transport until either a write succeeds or the TTL expires.
+func (t *YandexDocsTransport) takeRetryBatch() []queuedPacket {
+	t.queueMu.Lock()
+	defer t.queueMu.Unlock()
+	if len(t.retryQueue) == 0 {
+		return nil
+	}
+	batch := t.retryQueue
+	t.retryQueue = nil
+	return batch
+}
+
+func (t *YandexDocsTransport) requeueBatch(batch []queuedPacket) {
+	if len(batch) == 0 {
+		return
+	}
+	now := time.Now()
+	kept := batch[:0]
+	var bytes uint64
+	for _, packet := range batch {
+		if now.Sub(packet.queuedAt) > maxQueuedPacketAge {
+			t.expiredDrops.Add(1)
+			t.queuedPackets.Add(^uint64(0))
+			if len(packet.data) > 0 {
+				t.queuedBytes.Add(^uint64(len(packet.data) - 1))
+			}
+			continue
+		}
+		kept = append(kept, packet)
+		bytes += uint64(len(packet.data))
+	}
+	if len(kept) == 0 {
+		return
+	}
+	t.queueMu.Lock()
+	// Keep the older retry data before a retry added by a concurrent writer.
+	t.retryQueue = append(kept, t.retryQueue...)
+	t.queueMu.Unlock()
+	t.retryQueued.Add(uint64(len(kept)))
+	_ = bytes
+}
+
+func (t *YandexDocsTransport) dequeuePacket(packet queuedPacket) {
+	t.queuedPackets.Add(^uint64(0))
+	if len(packet.data) > 0 {
+		t.queuedBytes.Add(^uint64(len(packet.data) - 1))
+	}
+}
+
+// Stats includes transport-local queue health used by the Android service and
+// the server journal.  BaseTransport remains suitable for transports that do
+// not buffer application packets.
+func (t *YandexDocsTransport) Stats() transport.TransportStats {
+	s := t.BaseTransport.Stats()
+	s.RetryQueued = t.retryQueued.Load()
+	s.ExpiredDrops = t.expiredDrops.Load()
+	s.QueuePackets = t.queuedPackets.Load()
+	s.QueueBytes = t.queuedBytes.Load()
+	s.WriteFailures = t.writeFailures.Load()
+	return s
 }
 
 func (t *YandexDocsTransport) connectToDoc(attempt int) {
@@ -372,15 +468,21 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		authData := map[string]interface{}{
 			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
-			"documentCallbackUrl": info.CallbackURL,
-			"user":                map[string]interface{}{"id": userID, "username": "", "firstname": "", "lastname": "", "indexUser": -1}, "editorType": 0,
-			"lastOtherSaveTime": -1, "permissions": info.Permissions,
-			"block": []interface{}{}, "sessionId": userID, "sessionTimeConnect": 0,
-			"sessionTimeIdle": 0, "documentFormatSave": info.OpenCmd["format"],
-			"isCloseCoAuthoring": false, "openCmd": info.OpenCmd, "lang": "en-US",
-			"mode": "edit", "encrypted": false, "IsAnonymousUser": true,
-			"timezoneOffset": 0, "headingsColor": "", "coEditingMode": "fast",
-			"jwtOpen": info.Token, "jwtSession": info.Token, "time": time.Now().UnixMilli(),
+			// Keep the field set compatible with the current editor.  In
+			// particular, documentCallbackUrl and authChanges ACK support are
+			// required when a document is already opened by the exit node: without
+			// them the editor returns waitAuth and never promotes the second peer
+			// to an authenticated co-author.  Do not restore legacy fabricated
+			// session/JWT fields here: those are rejected by current deployments.
+			"documentCallbackUrl":   info.CallbackURL,
+			"user":                  map[string]interface{}{"id": userID},
+			"editorType":            0,
+			"lastOtherSaveTime":     -1,
+			"permissions":           info.Permissions,
+			"openCmd":               info.OpenCmd,
+			"coEditingMode":         "fast",
+			"jwtOpen":               info.Token,
+			"supportAuthChangesAck": true,
 		}
 		messagePart, _ := json.Marshal([]interface{}{"message", authData})
 		if err := session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart)))); err != nil {
@@ -674,26 +776,46 @@ func (t *YandexDocsTransport) writerLoop() {
 			continue
 		}
 
-		var packet queuedPacket
-		if hasPending {
-			packet, hasPending = pending, false
-		} else {
-			select {
-			case packet = <-session.WriteQueue:
-			case <-refresh.C:
-				continue
+		// A failed frame is retried before newer work.  It remains a logical
+		// batch, so a short reconnect cannot reorder its constituent packets.
+		items := t.takeRetryBatch()
+		retrying := len(items) != 0
+		if len(items) == 0 {
+			var packet queuedPacket
+			if hasPending {
+				packet, hasPending = pending, false
+			} else {
+				select {
+				case packet = <-session.WriteQueue:
+				case <-refresh.C:
+					continue
+				}
 			}
+			items = append(items, packet)
 		}
 		if !t.isCurrentSession(session) {
-			pending, hasPending = packet, true
+			t.requeueBatch(items)
 			continue
 		}
-		if time.Since(packet.queuedAt) > maxQueuedPacketAge {
-			// Replaying a stale IP packet after a WebSocket reconnect creates
-			// misleading retransmits and holds the new session hostage. TCP will
-			// retransmit current data itself when it still matters.
+
+		// Drop expired data before encoding it.  The counter is decremented only
+		// when an item leaves the transport permanently; a retry stays counted.
+		live := items[:0]
+		for _, item := range items {
+			if time.Since(item.queuedAt) > maxQueuedPacketAge || len(item.data) > 0xffff {
+				t.expiredDrops.Add(1)
+				t.dequeuePacket(item)
+				continue
+			}
+			live = append(live, item)
+		}
+		items = live
+		if len(items) == 0 {
 			continue
 		}
+
+		// Only newly dequeued data is coalesced below. Retried batches are kept
+		// ahead of newer packets so a reconnect cannot reorder the queue.
 		{
 			// Coalesce packets arriving in the same scheduler window. The
 			// length-prefixed binary payload is opaque to Yandex and is decoded
@@ -703,9 +825,6 @@ func (t *YandexDocsTransport) writerLoop() {
 			payload = append(payload, batchMagic...)
 			appendPacket := func(item queuedPacket) bool {
 				p := item.data
-				if time.Since(item.queuedAt) > maxQueuedPacketAge {
-					return true
-				}
 				if len(p) > 0xffff {
 					return false
 				}
@@ -720,29 +839,54 @@ func (t *YandexDocsTransport) writerLoop() {
 				payload = append(payload, p...)
 				return true
 			}
-			_ = appendPacket(packet)
+			encodedItems := make([]queuedPacket, 0, len(items)+8)
+			for index, item := range items {
+				if appendPacket(item) {
+					encodedItems = append(encodedItems, item)
+				} else {
+					if retrying {
+						t.requeueBatch(items[index:])
+					} else {
+						pending, hasPending = item, true
+					}
+					break
+				}
+			}
+			if len(encodedItems) == 0 {
+				t.requeueBatch(items)
+				yandexBatchPool.Put(payload[:0])
+				continue
+			}
 			// One coalescing deadline starts with the first packet. The old
 			// nested select created a fresh timer after every queue gap, so a
 			// burst could be delayed by many 0.5 ms windows in succession.
-			batchTimer := time.NewTimer(batchCoalesceDelay)
-			batchTimerActive := true
-		batchLoop:
-			for len(payload) < batchMaxPayload {
-				select {
-				case next := <-session.WriteQueue:
-					if !appendPacket(next) {
-						pending, hasPending = next, true
+			if !retrying {
+				batchTimer := time.NewTimer(batchCoalesceDelay)
+				batchTimerActive := true
+			batchLoop:
+				for len(payload) < batchMaxPayload {
+					select {
+					case next := <-session.WriteQueue:
+						if time.Since(next.queuedAt) > maxQueuedPacketAge || len(next.data) > 0xffff {
+							t.expiredDrops.Add(1)
+							t.dequeuePacket(next)
+							continue
+						}
+						if !appendPacket(next) {
+							pending, hasPending = next, true
+							break batchLoop
+						}
+						encodedItems = append(encodedItems, next)
+					case <-batchTimer.C:
+						batchTimerActive = false
 						break batchLoop
 					}
-				case <-batchTimer.C:
-					batchTimerActive = false
-					break batchLoop
 				}
-			}
-			if batchTimerActive && !batchTimer.Stop() {
-				select {
-				case <-batchTimer.C:
-				default:
+				if batchTimerActive && !batchTimer.Stop() {
+					select {
+					case <-batchTimer.C:
+					default:
+					}
 				}
 			}
 			// Build the JSON frame directly into a pooled buffer. This avoids the
@@ -753,6 +897,7 @@ func (t *YandexDocsTransport) writerLoop() {
 			frame = append(frame, `42["message",{"type":"cursor","cursor":"18;`...)
 			wirePayload, sealErr := t.secure.seal(payload)
 			if sealErr != nil {
+				t.requeueBatch(encodedItems)
 				yandexBatchPool.Put(payload[:0])
 				yandexFramePool.Put(frame[:0])
 				continue
@@ -768,6 +913,8 @@ func (t *YandexDocsTransport) writerLoop() {
 			base64.StdEncoding.Encode(frame[start:], wirePayload)
 			frame = append(frame, `"}]`...)
 			if err := session.safeWrite(websocket.TextMessage, frame); err != nil {
+				t.writeFailures.Add(1)
+				t.requeueBatch(encodedItems)
 				if !t.isCurrentSession(session) {
 					if cap(frame) <= 64<<10 {
 						yandexFramePool.Put(frame[:0])
@@ -783,6 +930,10 @@ func (t *YandexDocsTransport) writerLoop() {
 				_ = session.Conn.Close()
 				t.scheduleReconnect(0)
 				time.Sleep(25 * time.Millisecond)
+			} else {
+				for _, item := range encodedItems {
+					t.dequeuePacket(item)
+				}
 			}
 			if cap(frame) <= 64<<10 {
 				yandexFramePool.Put(frame[:0])
@@ -909,6 +1060,25 @@ func enginePollingURL(wsURL string) (string, error) {
 
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
+	if strings.Contains(text, `"type":"waitAuth"`) && !t.IsConnected() {
+		// OnlyOffice emits waitAuth when a document is already being opened by
+		// the peer.  The WebSocket is live and it continues to relay cursor
+		// events, but a result=1 message is deferred until the collaborative lock
+		// settles.  Treat it as a transport-ready intermediate state; the Android
+		// service still exposes the VPN only after the separate encrypted peer and
+		// DNS/TCP checks succeed.
+		t.SetConnected(true)
+		log.Printf("[PAPERFLUX] YANDEX_WAIT_AUTH: editor session is live; awaiting collaborative lock")
+		t.startSecureSession(session, true)
+		return
+	}
+	if strings.Contains(text, `"type":"error"`) {
+		// An editor-side rejection used to look like an ordinary frame in the
+		// diagnostic log, leaving a client stuck at authentication for 75s.
+		// Log only the small, non-secret reason fields; never expose refresh
+		// tokens, document links, cookies, or the complete editor payload.
+		log.Printf("[PAPERFLUX] Yandex editor rejected auth: %s", editorErrorSummary(data))
+	}
 	if strings.Contains(text, `"type":"paperfluxIdentity"`) {
 		log.Printf("[PAPERFLUX] peer profile identity received")
 		return
@@ -950,6 +1120,9 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	if strings.Contains(text, "saveChanges") || strings.Contains(text, "cursor") {
 		base64Str := t.extractBase64String(text)
 		if base64Str == "" {
+			if session != nil && session.diagSecure.Add(1) <= 4 {
+				log.Printf("[PAPERFLUX] secure frame ignored: editor event contained no supported payload")
+			}
 			return
 		}
 		if len(base64Str) > base64.StdEncoding.EncodedLen(maxSecureFrame+secureHeader+16) {
@@ -962,8 +1135,19 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 			return
 		}
 		if len(decoded) >= 5 && bytes.Equal(decoded[:4], secureMagic) && (decoded[4] == 1 || decoded[4] == 2) {
+			if session != nil && session.diagSecure.Add(1) <= 8 {
+				log.Printf("[PAPERFLUX] PFS2 handshake received kind=%d bytes=%d", decoded[4], len(decoded))
+			}
 			if ack, e := t.secure.receiveHandshake(decoded); e == nil && ack != nil {
+				if session != nil && session.diagSecure.Add(1) <= 8 {
+					log.Printf("[PAPERFLUX] PFS2 handshake accepted; sending acknowledgement")
+				}
 				_ = t.writeSecureFrame(session, ack)
+			} else if e != nil && session != nil && session.diagSecure.Add(1) <= 8 {
+				// The event body is intentionally not logged: it can contain editor
+				// metadata.  Kind and byte length are sufficient to diagnose protocol
+				// compatibility without exposing document content or credentials.
+				log.Printf("[PAPERFLUX] PFS2 handshake rejected kind=%d bytes=%d", decoded[4], len(decoded))
 			}
 			// If this was the peer ACK, the channel is now ready. Send the
 			// authenticated liveness challenge in the same turn instead of
@@ -1029,9 +1213,46 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 }
 
+func editorErrorSummary(message []byte) string {
+	if !bytes.HasPrefix(message, []byte("42")) {
+		return "unrecognised error frame"
+	}
+	var event []json.RawMessage
+	if err := json.Unmarshal(message[2:], &event); err != nil || len(event) < 2 {
+		return "malformed error frame"
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(event[1], &payload); err != nil {
+		return "error payload unavailable"
+	}
+	parts := make([]string, 0, 3)
+	for _, key := range []string{"code", "message", "error", "description"} {
+		value, ok := payload[key]
+		if !ok || len(parts) == 3 {
+			continue
+		}
+		var text string
+		if json.Unmarshal(value, &text) == nil {
+			parts = append(parts, key+"="+strconv.Quote(text))
+			continue
+		}
+		var number json.Number
+		if json.Unmarshal(value, &number) == nil {
+			parts = append(parts, key+"="+number.String())
+		}
+	}
+	if len(parts) == 0 {
+		return "no public reason fields"
+	}
+	return strings.Join(parts, " ")
+}
+
 func (t *YandexDocsTransport) writeSecureFrame(session *DocSession, payload []byte) error {
 	if session == nil || session.Conn == nil {
 		return errSecure
+	}
+	if len(payload) >= 5 && bytes.Equal(payload[:4], secureMagic) && (payload[4] == 1 || payload[4] == 2) && session.diagSecure.Add(1) <= 8 {
+		log.Printf("[PAPERFLUX] PFS2 handshake sent kind=%d bytes=%d", payload[4], len(payload))
 	}
 	frame := []byte(`42["message",{"type":"cursor","cursor":"18;` + base64.StdEncoding.EncodeToString(payload) + `"}]`)
 	return session.safeWrite(websocket.TextMessage, frame)

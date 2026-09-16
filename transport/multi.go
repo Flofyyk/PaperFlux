@@ -3,7 +3,7 @@ package transport
 import (
 	"encoding/binary"
 	"hash/fnv"
-	"os"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,11 +19,13 @@ type MultiTransport struct {
 	// node: a reply packet must leave through the same Yandex document lane as
 	// the packet that opened the flow, otherwise it can reach a different
 	// Android worker/TCP stack and the connection stalls.
-	flowLanes    map[uint32]flowBinding
-	scores       []int64
+	flowLanes    map[string]flowBinding
+	activeFlows  []uint64
 	rr           atomic.Uint32
 	receiveQueue chan []byte
 	receiveStop  chan struct{}
+	lastCleanup  time.Time
+	lastReady    atomic.Int32
 }
 
 type flowBinding struct {
@@ -32,7 +34,7 @@ type flowBinding struct {
 }
 
 func NewMultiTransport(lanes []Transport, config TransportConfig) *MultiTransport {
-	return &MultiTransport{BaseTransport: NewBaseTransport(config), lanes: lanes, flowLanes: make(map[uint32]flowBinding), scores: make([]int64, len(lanes))}
+	return &MultiTransport{BaseTransport: NewBaseTransport(config), lanes: lanes, flowLanes: make(map[string]flowBinding), activeFlows: make([]uint64, len(lanes))}
 }
 
 func (m *MultiTransport) Start() error {
@@ -42,10 +44,17 @@ func (m *MultiTransport) Start() error {
 	m.receiveQueue = make(chan []byte, m.GetConfig().MaxQueueSize)
 	m.receiveStop = make(chan struct{})
 	go m.receiveLoop()
+	started := make([]Transport, 0, len(m.lanes))
 	for laneIndex, lane := range m.lanes {
 		if err := lane.Start(); err != nil {
+			for _, ready := range started {
+				_ = ready.Stop()
+			}
+			close(m.receiveStop)
+			_ = m.BaseTransport.Stop()
 			return err
 		}
+		started = append(started, lane)
 		idx := laneIndex
 		lane.Receive(func(packet []byte) {
 			// Learn the physical lane on which this flow arrived.  The binding is
@@ -59,27 +68,44 @@ func (m *MultiTransport) Start() error {
 			}
 		})
 	}
-	if os.Getenv("OPENFLUX_ADAPTIVE_LANES") == "1" {
-		go m.measureLanes()
-	}
+	go m.monitorLanes()
+	go m.statsLoop()
 	return nil
 }
 
-// measureLanes keeps a short-lived throughput score. It is only used when a
-// new flow is assigned; packets of an existing flow remain pinned to one lane.
-func (m *MultiTransport) measureLanes() {
-	prev := make([]uint64, len(m.lanes))
-	for m.IsRunning() {
-		time.Sleep(time.Second)
-		for i, lane := range m.lanes {
-			bytes := lane.Stats().BytesSent
-			if bytes >= prev[i] {
-				m.mu.Lock()
-				m.scores[i] = int64(bytes - prev[i])
-				m.mu.Unlock()
-			}
-			prev[i] = bytes
+// LaneStatus reports authenticated document lines without exposing their URLs.
+// It lets a UI distinguish a partial outage from a failed tunnel.
+func (m *MultiTransport) LaneStatus() (ready, total int) {
+	for _, lane := range m.lanes {
+		if lane.IsConnected() {
+			ready++
 		}
+	}
+	return ready, len(m.lanes)
+}
+
+func (m *MultiTransport) monitorLanes() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for m.IsRunning() {
+		ready, total := m.LaneStatus()
+		if int32(ready) != m.lastReady.Swap(int32(ready)) {
+			log.Printf("[PAPERFLUX_LANES] ready=%d/%d", ready, total)
+		}
+		<-ticker.C
+	}
+}
+
+// statsLoop is deliberately owned by the aggregate transport.  Per-document
+// counters are not comparable: they reset independently after a reconnect and
+// made Android add one lane's total to another lane's total.
+func (m *MultiTransport) statsLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for m.IsRunning() {
+		<-ticker.C
+		s := m.Stats()
+		log.Printf("[PAPERFLUX_STATS] rx=%d tx=%d ping=0", s.BytesReceived, s.BytesSent)
 	}
 }
 
@@ -95,7 +121,8 @@ func (m *MultiTransport) Stop() error {
 		_ = lane.Stop()
 	}
 	m.mu.Lock()
-	m.flowLanes = make(map[uint32]flowBinding)
+	m.flowLanes = make(map[string]flowBinding)
+	m.activeFlows = make([]uint64, len(m.lanes))
 	m.mu.Unlock()
 	return m.BaseTransport.Stop()
 }
@@ -127,7 +154,22 @@ func (m *MultiTransport) Send(packet []byte) error {
 	if len(m.lanes) == 0 {
 		return ErrNoLane
 	}
-	key := flowHash(packet)
+	key := flowKey(packet)
+	// ACK/hello frames are not IP connections. Keeping every ACK sequence as
+	// a binding made flow counts grow with traffic and skewed lane selection.
+	if key == "" {
+		start := int(m.rr.Add(1)-1) % len(m.lanes)
+		for offset := range m.lanes {
+			lane := m.lanes[(start+offset)%len(m.lanes)]
+			if lane.IsConnected() {
+				if err := lane.Send(packet); err == nil {
+					m.RecordSend(len(packet))
+					return nil
+				}
+			}
+		}
+		return ErrNoLane
+	}
 	m.mu.RLock()
 	binding, ok := m.flowLanes[key]
 	m.mu.RUnlock()
@@ -138,14 +180,15 @@ func (m *MultiTransport) Send(packet []byte) error {
 	if !ok {
 		start = m.pickLane()
 		m.mu.Lock()
+		m.cleanupLocked(time.Now())
 		if existing, exists := m.flowLanes[key]; exists {
 			if time.Since(existing.seenAt) < 10*time.Minute {
 				start = existing.lane
 			} else {
-				m.flowLanes[key] = flowBinding{lane: start, seenAt: time.Now()}
+				m.replaceBindingLocked(key, start, time.Now())
 			}
 		} else {
-			m.flowLanes[key] = flowBinding{lane: start, seenAt: time.Now()}
+			m.replaceBindingLocked(key, start, time.Now())
 		}
 		m.mu.Unlock()
 	}
@@ -167,17 +210,44 @@ func (m *MultiTransport) Send(packet []byte) error {
 }
 
 func (m *MultiTransport) bindFlow(packet []byte, lane int) {
-	key := flowHash(packet)
+	key := flowKey(packet)
 	m.bindFlowLane(key, lane)
 }
 
-func (m *MultiTransport) bindFlowLane(key uint32, lane int) {
-	if key == 0 || lane < 0 || lane >= len(m.lanes) {
+func (m *MultiTransport) bindFlowLane(key string, lane int) {
+	if key == "" || lane < 0 || lane >= len(m.lanes) {
 		return
 	}
 	m.mu.Lock()
-	m.flowLanes[key] = flowBinding{lane: lane, seenAt: time.Now()}
+	m.replaceBindingLocked(key, lane, time.Now())
 	m.mu.Unlock()
+}
+
+func (m *MultiTransport) replaceBindingLocked(key string, lane int, now time.Time) {
+	previous, exists := m.flowLanes[key]
+	if exists && previous.lane != lane && previous.lane >= 0 && previous.lane < len(m.activeFlows) && m.activeFlows[previous.lane] > 0 {
+		m.activeFlows[previous.lane]--
+	}
+	if (!exists || previous.lane != lane) && lane >= 0 && lane < len(m.activeFlows) {
+		m.activeFlows[lane]++
+	}
+	m.flowLanes[key] = flowBinding{lane: lane, seenAt: now}
+}
+
+func (m *MultiTransport) cleanupLocked(now time.Time) {
+	if now.Sub(m.lastCleanup) < time.Minute {
+		return
+	}
+	m.lastCleanup = now
+	for key, binding := range m.flowLanes {
+		if now.Sub(binding.seenAt) < 10*time.Minute {
+			continue
+		}
+		if binding.lane >= 0 && binding.lane < len(m.activeFlows) && m.activeFlows[binding.lane] > 0 {
+			m.activeFlows[binding.lane]--
+		}
+		delete(m.flowLanes, key)
+	}
 }
 
 func (m *MultiTransport) pickLane() int {
@@ -185,16 +255,17 @@ func (m *MultiTransport) pickLane() int {
 		return 0
 	}
 	best := -1
-	var score int64 = -1
+	var flows uint64
+	start := int(m.rr.Add(1)-1) % len(m.lanes)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for i, lane := range m.lanes {
 		if !lane.IsConnected() {
 			continue
 		}
-		m.mu.RLock()
-		s := m.scores[i]
-		m.mu.RUnlock()
-		if s > score {
-			best, score = i, s
+		active := m.activeFlows[i]
+		if best < 0 || active < flows || (active == flows && ((i-start+len(m.lanes))%len(m.lanes) < (best-start+len(m.lanes))%len(m.lanes))) {
+			best, flows = i, active
 		}
 	}
 	if best >= 0 {
@@ -205,6 +276,14 @@ func (m *MultiTransport) pickLane() int {
 
 func (m *MultiTransport) Stats() TransportStats {
 	s := m.BaseTransport.Stats()
+	for _, lane := range m.lanes {
+		ls := lane.Stats()
+		s.QueuePackets += ls.QueuePackets
+		s.QueueBytes += ls.QueueBytes
+		s.RetryQueued += ls.RetryQueued
+		s.ExpiredDrops += ls.ExpiredDrops
+		s.WriteFailures += ls.WriteFailures
+	}
 	s.Connected = m.IsConnected()
 	return s
 }
@@ -215,11 +294,16 @@ type multiError struct{ text string }
 
 func (e *multiError) Error() string { return e.text }
 
-func flowHash(packet []byte) uint32 {
+func flowKey(packet []byte) string {
+	if kind, _, _, payload, reliable := parseReliableFrame(packet); reliable {
+		if kind == reliableData {
+			return flowKey(payload)
+		}
+		return ""
+	}
 	if len(packet) >= 20 && packet[0]>>4 == 4 {
 		ihl := int(packet[0]&0x0f) * 4
 		if ihl >= 20 && len(packet) >= ihl+4 && (packet[9] == 6 || packet[9] == 17) {
-			h := fnv.New32a()
 			// Canonicalise the endpoints so client->server and server->client map
 			// to the same lane.  The previous direction-sensitive hash was the
 			// source of cross-worker SYN/ACK loss with Android multi-worker mode.
@@ -231,13 +315,10 @@ func flowHash(packet []byte) uint32 {
 			if string(endpointB[:]) < string(endpointA[:]) {
 				endpointA, endpointB = endpointB, endpointA
 			}
-			_, _ = h.Write(endpointA[:])
-			_, _ = h.Write(endpointB[:])
-			_, _ = h.Write([]byte{packet[9]})
-			return h.Sum32()
+			return string(append(append(endpointA[:], endpointB[:]...), packet[9]))
 		}
 	}
-	h := fnv.New32a()
+	h := fnv.New64a()
 	_, _ = h.Write(packet)
-	return h.Sum32()
+	return string(binary.BigEndian.AppendUint64(nil, h.Sum64()))
 }
