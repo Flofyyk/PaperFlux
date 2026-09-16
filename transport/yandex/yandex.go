@@ -132,7 +132,7 @@ type pendingProof struct {
 var yandexFramePool = sync.Pool{New: func() interface{} { return make([]byte, 0, 4096) }}
 
 const batchMaxPayload = 32 << 10
-const batchMinPayload = 8 << 10
+const batchMinPayload = 16 << 10
 const maxLaneQueuePackets = 2048
 const batchCoalesceDelay = 500 * time.Microsecond
 const maxQueuedPacketAge = 12 * time.Second

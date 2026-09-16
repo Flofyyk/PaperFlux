@@ -50,6 +50,12 @@ func (m *MultiTransport) Start() error {
 	go m.receiveLoop()
 	started := make([]Transport, 0, len(m.lanes))
 	for laneIndex, lane := range m.lanes {
+		// Keep document sessions out of the same Yandex balancer time bucket.
+		// Starting both lanes on the same scheduler tick made their remote idle
+		// rotations line up and caused a brief full outage on every rotation.
+		if laneIndex > 0 {
+			time.Sleep(4 * time.Second)
+		}
 		if err := lane.Start(); err != nil {
 			for _, ready := range started {
 				_ = ready.Stop()

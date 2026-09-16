@@ -21,10 +21,10 @@ const (
 	reliableHello            byte = 1
 	reliableAck              byte = 2
 	reliableData             byte = 3
-	reliableMaxPending            = 256
-	reliableMaxBytes              = 2 << 20
-	reliableSoftPending           = 192
-	reliableSoftBytes             = 1 << 20
+	reliableMaxPending            = 384
+	reliableMaxBytes              = 3 << 20
+	reliableSoftPending           = 288
+	reliableSoftBytes             = 1536 << 10
 	reliableBackpressureWait      = 120 * time.Millisecond
 )
 
