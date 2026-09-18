@@ -68,11 +68,12 @@ WantedBy=multi-user.target
 
 `proxy` — режим по умолчанию в этой инструкции. Он ограничивает одновременные TCP-потоки и открывает обычные исходящие соединения от VPS; root и iptables не нужны.
 
-Если требуется старый пакетный режим, замените `--mode proxy` на `--mode raw`, установите `User=root` и добавьте правило ниже. Оно подавляет исходящие TCP RST на всём сервере, а не только для PaperFlux, поэтому используйте выделенный VPS.
+Если требуется пакетный режим, замените `--mode proxy` на `--mode raw`, установите `User=root` и добавьте правило ниже. Оно подавляет TCP RST только для исходящего адреса exit-node, не затрагивая остальные исходящие соединения сервера.
 
 ```bash
-sudo iptables -C OUTPUT -p tcp --tcp-flags RST RST -j DROP || \
-  sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+EXIT_IP=$(ip route get 1.1.1.1 | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1)
+sudo iptables -C OUTPUT -s "$EXIT_IP" -p tcp --tcp-flags RST RST -j DROP || \
+  sudo iptables -A OUTPUT -s "$EXIT_IP" -p tcp --tcp-flags RST RST -j DROP
 ```
 
 Сохраните правила firewall способом, принятым в вашей ОС, затем включите сервис:
@@ -94,7 +95,8 @@ sudo journalctl -u paperflux -f
 Для удаления правила RST в raw-режиме выполните:
 
 ```bash
-sudo iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP
+EXIT_IP=$(ip route get 1.1.1.1 | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1)
+sudo iptables -D OUTPUT -s "$EXIT_IP" -p tcp --tcp-flags RST RST -j DROP
 ```
 
 ### Обновление

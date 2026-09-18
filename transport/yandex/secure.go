@@ -83,6 +83,35 @@ func (c *secureChannel) hello() []byte {
 	b := c.header(1)
 	return append(b, c.mac(b)...)
 }
+
+// rotateEpoch starts a fresh authenticated key epoch for a replacement
+// document WebSocket. A document close is a transport boundary: retaining the
+// old peer epoch lets two independently reconnecting endpoints reject each
+// other's otherwise valid HELLO as a retired key and leaves the tunnel in a
+// permanent hello loop. The master secret is retained; only ephemeral X25519
+// state and packet replay state are replaced.
+func (c *secureChannel) rotateEpoch() error {
+	private, err := ecdh.X25519().GenerateKey(crand.Reader)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.private = private
+	copy(c.local[:], private.PublicKey().Bytes())
+	c.peer = [32]byte{}
+	c.havePeer = false
+	c.confirmed = false
+	c.send = nil
+	c.recv = nil
+	c.seq = 0
+	c.high = 0
+	c.bitmap = 0
+	c.seen = false
+	c.retired = make(map[[32]byte]bool)
+	return nil
+}
+
 func (c *secureChannel) keys() error {
 	pub, err := ecdh.X25519().NewPublicKey(c.peer[:])
 	if err != nil {

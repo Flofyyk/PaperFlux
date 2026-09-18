@@ -112,10 +112,27 @@ func (m *MultiTransport) monitorLanes() {
 func (m *MultiTransport) statsLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	previous := make([]TransportStats, len(m.lanes))
 	for m.IsRunning() {
 		<-ticker.C
 		s := m.Stats()
-		log.Printf("[PAPERFLUX_STATS] rx=%d tx=%d ping=0", s.BytesReceived, s.BytesSent)
+		// A tunnel may have several independent document lanes. The UI needs one
+		// meaningful control-plane RTT, not a fabricated average over routes with
+		// different queues. Report the lowest current RTT among authenticated
+		// lanes; it is the route selected for new flows under normal pressure.
+		ping := time.Duration(0)
+		for index, lane := range m.lanes {
+			health := laneHealth(lane)
+			if health.Connected && health.RTT > 0 && (ping == 0 || health.RTT < ping) {
+				ping = health.RTT
+			}
+			laneStats := lane.Stats()
+			txRate := (laneStats.BytesSent - previous[index].BytesSent) / 5
+			rxRate := (laneStats.BytesReceived - previous[index].BytesReceived) / 5
+			previous[index] = laneStats
+			log.Printf("[PAPERFLUX_LANE] lane=%d connected=%t queue_ppm=%d rtt_ms=%d tx_bps=%d rx_bps=%d tx=%d rx=%d write_failures=%d", index+1, health.Connected, int(health.QueueLoad*1_000_000), health.RTT.Milliseconds(), txRate, rxRate, laneStats.BytesSent, laneStats.BytesReceived, health.WriteFailures)
+		}
+		log.Printf("[PAPERFLUX_STATS] rx=%d tx=%d ping=%d", s.BytesReceived, s.BytesSent, ping.Milliseconds())
 	}
 }
 
@@ -168,7 +185,7 @@ func (m *MultiTransport) Send(packet []byte) error {
 	// ACK/hello frames are not IP connections. Keeping every ACK sequence as
 	// a binding made flow counts grow with traffic and skewed lane selection.
 	if key == "" {
-		start := int(m.rr.Add(1)-1) % len(m.lanes)
+		start := m.pickAdaptiveLane()
 		for offset := range m.lanes {
 			lane := m.lanes[(start+offset)%len(m.lanes)]
 			if lane.IsConnected() {
@@ -270,7 +287,7 @@ func (m *MultiTransport) pickLane() int {
 		return 0
 	}
 	best := -1
-	var flows uint64
+	bestScore := 0.0
 	start := int(m.rr.Add(1)-1) % len(m.lanes)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -278,15 +295,106 @@ func (m *MultiTransport) pickLane() int {
 		if !lane.IsConnected() {
 			continue
 		}
-		active := m.activeFlows[i]
-		if best < 0 || active < flows || (active == flows && ((i-start+len(m.lanes))%len(m.lanes) < (best-start+len(m.lanes))%len(m.lanes))) {
-			best, flows = i, active
+		health := laneHealth(lane)
+		// The writer queue is the earliest congestion signal. RTT is useful once
+		// queues are similarly empty, while active flow count keeps an otherwise
+		// equal pair evenly spread.  A flow is selected only once and is pinned
+		// afterwards, so this cannot reorder an established TCP connection.
+		score := health.QueueLoad*10_000 + float64(health.RTT.Milliseconds()) + float64(m.activeFlows[i])*5
+		rotation := (i - start + len(m.lanes)) % len(m.lanes)
+		bestRotation := (best - start + len(m.lanes)) % len(m.lanes)
+		if best < 0 || score < bestScore || (score == bestScore && rotation < bestRotation) {
+			best, bestScore = i, score
 		}
 	}
 	if best >= 0 {
 		return best
 	}
 	return int(m.rr.Add(1)-1) % len(m.lanes)
+}
+
+// pickAdaptiveLane is used for bond envelopes and control frames, which do
+// not have a stable five-tuple. It selects the line with the smallest current
+// queue and then lower observed RTT; active-flow count is only a final tie
+// breaker. Existing non-bonded flows stay pinned in Send above.
+func (m *MultiTransport) pickAdaptiveLane() int {
+	if len(m.lanes) == 0 {
+		return 0
+	}
+	best := -1
+	bestScore := 0.0
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for index, lane := range m.lanes {
+		health := laneHealth(lane)
+		if !health.Connected {
+			continue
+		}
+		score := health.QueueLoad*10_000 + float64(health.RTT.Milliseconds()) + float64(m.activeFlows[index])*5
+		if best < 0 || score < bestScore {
+			best, bestScore = index, score
+		}
+	}
+	if best >= 0 {
+		return best
+	}
+	return int(m.rr.Add(1)-1) % len(m.lanes)
+}
+
+// BondEligible prevents a fast flow from being striped onto a document that
+// is currently much slower than its peer. A second line helps only while its
+// control-plane delay is comparable; otherwise it creates avoidable packet
+// reordering and lowers goodput. The threshold is intentionally conservative
+// and evaluated continuously, not stored as a user-visible tunnel state.
+func (m *MultiTransport) BondEligible() bool {
+	if len(m.lanes) < 2 {
+		return false
+	}
+	fastest := time.Duration(0)
+	slowest := time.Duration(0)
+	for _, lane := range m.lanes {
+		health := laneHealth(lane)
+		if !health.Connected || health.QueueLoad >= 0.5 || health.RTT <= 0 {
+			return false
+		}
+		if fastest == 0 || health.RTT < fastest {
+			fastest = health.RTT
+		}
+		if health.RTT > slowest {
+			slowest = health.RTT
+		}
+	}
+	return slowest <= fastest*3/2
+}
+
+// ReorderDeadline follows the observed line skew. It is never lower than a
+// normal scheduler turn and never high enough to turn a missing packet into a
+// perceptible pause for another flow.
+func (m *MultiTransport) ReorderDeadline() time.Duration {
+	var fastest, slowest time.Duration
+	for _, lane := range m.lanes {
+		rtt := laneHealth(lane).RTT
+		if rtt <= 0 {
+			continue
+		}
+		if fastest == 0 || rtt < fastest {
+			fastest = rtt
+		}
+		if rtt > slowest {
+			slowest = rtt
+		}
+	}
+	if fastest == 0 || slowest <= fastest {
+		return bondMinGapAge
+	}
+	return min(bondMaxGapAge, max(bondMinGapAge, (slowest-fastest)/2))
+}
+
+func laneHealth(lane Transport) LaneHealth {
+	if reporter, ok := lane.(LaneHealthReporter); ok {
+		return reporter.LaneHealth()
+	}
+	return LaneHealth{Connected: lane.IsConnected()}
 }
 
 func (m *MultiTransport) Stats() TransportStats {

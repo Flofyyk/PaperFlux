@@ -77,6 +77,34 @@ func TestSecureWrongCredentialsAndRestart(t *testing.T) {
 		t.Fatal("retired epoch accepted")
 	}
 }
+
+func TestSecureRotateEpochReestablishesAfterDocumentReplacement(t *testing.T) {
+	a, b := pair(t)
+	old, err := a.seal([]byte("before rotation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.rotateEpoch(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.rotateEpoch(); err != nil {
+		t.Fatal(err)
+	}
+	if a.ready() || b.ready() {
+		t.Fatal("rotated channels remained ready")
+	}
+	handshake(t, a, b)
+	if _, err := b.open(old); err == nil {
+		t.Fatal("frame from retired document epoch accepted")
+	}
+	frame, err := a.seal([]byte("after rotation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, err := b.open(frame); err != nil || !bytes.Equal(plain, []byte("after rotation")) {
+		t.Fatalf("rotated channel unusable: %q %v", plain, err)
+	}
+}
 func TestSecureRequiresHandshake(t *testing.T) {
 	a, _ := newSecureChannel("42", "0123456789abcdef0123456789abcdef", "doc", false)
 	if _, e := a.seal([]byte("data")); e == nil {

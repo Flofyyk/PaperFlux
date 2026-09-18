@@ -119,13 +119,11 @@ func main() {
 				}
 			}
 			trans = transport.NewMultiTransport(lanes, config)
-			// The wrapper begins in legacy pass-through mode and enables ACK/retry
-			// only after the peer advertises the same capability.
-			reliable, err := transport.NewReliableTransport(trans, config)
-			if err != nil {
-				log.Fatalf("Configure reliable multi-transport: %v", err)
-			}
-			trans = reliable
+			// Each document lane is already a WebSocket over TCP, therefore it
+			// provides ordered, acknowledged delivery while that session is alive.
+			// A second ACK/retry layer across two independently rotating documents
+			// caused an ACK feedback queue on Android and reduced throughput. The
+			// Yandex transport owns bounded replay across a session rotation instead.
 			log.Printf("Yandex parallel document lanes: %d", len(lanes))
 		}
 	case "oneme":
@@ -213,7 +211,7 @@ func main() {
 	if *exitNode {
 		log.Printf("Running as EXIT NODE (%s mode)", exitMode)
 		if exitMode == tunnel.ExitModeRaw {
-			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+			log.Printf("! Raw mode requires an OUTPUT RST rule scoped to the exit-node source address; see docs/DEPLOYMENT.md")
 		}
 		select {}
 	} else {

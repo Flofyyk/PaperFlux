@@ -2,7 +2,6 @@ package tunnel
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -23,14 +22,13 @@ type RawSocketEndpoint struct {
 	tcpRecvFd       int
 	udpRecvFd       int
 	nicID           tcpip.NICID
+	egressIP        [4]byte
 	packetIn        atomic.Uint64
 	packetOut       atomic.Uint64
 	activeFlows     sync.Map // flowKey -> flowState
 	sendToTransport func([]byte)
 	clientIP        [4]byte
 	clientIPSet     atomic.Bool
-	traceIn         atomic.Uint64
-	traceOut        atomic.Uint64
 }
 
 type flowKey struct {
@@ -47,6 +45,14 @@ type flowState struct {
 }
 
 func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
+	// The exit's source address is stable for a worker lifetime. Resolving it
+	// with a UDP dial for every packet used to put a syscall-heavy network
+	// operation on both raw packet paths and became a visible throughput cap.
+	// Keep it once, as the upstream L3 backend does.
+	var egressIP [4]byte
+	if ip := net.ParseIP(getLocalIP()).To4(); ip != nil {
+		copy(egressIP[:], ip)
+	}
 	sendFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
 		return nil, fmt.Errorf("send socket failed: %v (need root)", err)
@@ -56,12 +62,17 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		syscall.Close(sendFd)
 		return nil, fmt.Errorf("IP_HDRINCL: %v", err)
 	}
+	// SOCK_RAW with IP_HDRINCL does not use TCP's autotuning. Larger bounded
+	// buffers absorb document-transport jitter on high-RTT paths; failures are
+	// harmless when the kernel caps them below this requested ceiling.
+	_ = syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024*1024)
 
 	tcpRecvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
 	if err != nil {
 		syscall.Close(sendFd)
 		return nil, fmt.Errorf("recv socket failed: %v (need root)", err)
 	}
+	_ = syscall.SetsockoptInt(tcpRecvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
 
 	addr := &syscall.SockaddrInet4{
 		Addr: [4]byte{0, 0, 0, 0},
@@ -78,6 +89,7 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		syscall.Close(tcpRecvFd)
 		return nil, fmt.Errorf("UDP recv socket failed: %v", err)
 	}
+	_ = syscall.SetsockoptInt(udpRecvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
 	if err := syscall.Bind(udpRecvFd, addr); err != nil {
 		syscall.Close(sendFd)
 		syscall.Close(tcpRecvFd)
@@ -90,6 +102,7 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		tcpRecvFd: tcpRecvFd,
 		udpRecvFd: udpRecvFd,
 		nicID:     nicID,
+		egressIP:  egressIP,
 	}
 
 	go ep.readLoop(tcpRecvFd, 6)
@@ -142,22 +155,16 @@ func (e *RawSocketEndpoint) readLoop(fd int, expectedProtocol byte) {
 		if protocol == 6 {
 			flags = buf[ihl+13]
 		}
-		dstIP := net.IP(buf[16:20])
-		localIP := getLocalIP()
-
-		if dstIP.String() == localIP {
+		if buf[16] == e.egressIP[0] && buf[17] == e.egressIP[1] && buf[18] == e.egressIP[2] && buf[19] == e.egressIP[3] {
 			srcPort := uint16(buf[ihl])<<8 | uint16(buf[ihl+1])
 			dstPort := uint16(buf[ihl+2])<<8 | uint16(buf[ihl+3])
 			var remote [4]byte
 			copy(remote[:], buf[12:16])
 			key := flowKey{protocol: protocol, remoteIP: remote, remotePort: srcPort, localPort: dstPort}
 			flow, active := e.activeFlows.Load(key)
-			if protocol == 6 && flags&(0x02|0x04|0x01) != 0 {
-				n := e.traceIn.Add(1)
-				if n <= 40 || n%500 == 0 {
-					log.Printf("[RAW-NIC%d] IN %s:%d -> %s:%d flags=%s active=%t", e.nicID, srcIP(buf), srcPort, dstIP, dstPort, tcpFlags(flags), active)
-				}
-			}
+			// Do not log flow addresses on the packet path. Apart from exposing
+			// destinations in persistent server logs, formatting these lines under
+			// load consumed enough CPU and I/O to affect tunnel throughput.
 
 			// Only deliver packets for ports opened by this gVisor instance.
 			// The raw socket also sees the VPS's own Yandex/SSH traffic.
@@ -243,10 +250,7 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 		copy(clientIP[:], ipPacket[12:16])
 		pktCopy := ipPacket
 
-		localIP := getLocalIP()
-		var localIPBytes [4]byte
-		fmt.Sscanf(localIP, "%d.%d.%d.%d", &localIPBytes[0], &localIPBytes[1], &localIPBytes[2], &localIPBytes[3])
-		copy(pktCopy[12:16], localIPBytes[:])
+		copy(pktCopy[12:16], e.egressIP[:])
 
 		ipHeaderLen := int(pktCopy[0]&0x0F) * 4
 		if ipHeaderLen < 20 || len(pktCopy) < ipHeaderLen+8 {
@@ -288,12 +292,8 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 		if protocol == 6 {
 			flags = transportHeader[13]
 		}
-		if protocol == 6 && flags&(0x02|0x04|0x01) != 0 {
-			nTrace := e.traceOut.Add(1)
-			if nTrace <= 40 || nTrace%500 == 0 {
-				log.Printf("[RAW-NIC%d] OUT %s:%d -> %s:%d flags=%s", e.nicID, net.IP(pktCopy[12:16]), srcPort, net.IP(pktCopy[16:20]), uint16(transportHeader[2])<<8|uint16(transportHeader[3]), tcpFlags(flags))
-			}
-		}
+		// Packet-path tracing is intentionally disabled in the normal build;
+		// diagnostics are available through the bounded aggregate counters.
 
 		if protocol == 6 && flags&0x02 != 0 {
 			seqNum := uint32(transportHeader[4])<<24 | uint32(transportHeader[5])<<16 | uint32(transportHeader[6])<<8 | uint32(transportHeader[7])
@@ -345,25 +345,6 @@ func (e *RawSocketEndpoint) expireFlows() {
 			return true
 		})
 	}
-}
-
-func srcIP(packet []byte) net.IP { return net.IPv4(packet[12], packet[13], packet[14], packet[15]) }
-
-func tcpFlags(flags byte) string {
-	var s string
-	if flags&0x02 != 0 {
-		s += "S"
-	}
-	if flags&0x10 != 0 {
-		s += "A"
-	}
-	if flags&0x01 != 0 {
-		s += "F"
-	}
-	if flags&0x04 != 0 {
-		s += "R"
-	}
-	return s
 }
 
 func (e *RawSocketEndpoint) MTU() uint32                    { return 1500 }

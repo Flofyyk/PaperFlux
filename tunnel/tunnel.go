@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -225,7 +226,9 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 
 func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 	id := request.ID()
-	destination := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+	// JoinHostPort preserves IPv6 bracket syntax. Formatting the pair manually
+	// works for IPv4 but produces an ambiguous address for IPv6 destinations.
+	destination := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 	select {
 	case t.proxyFlows <- struct{}{}:
 	default:

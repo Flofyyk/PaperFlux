@@ -38,6 +38,22 @@ type TransportStats struct {
 	Uptime        time.Duration
 }
 
+// LaneHealth is an optional live view used by a multi-lane transport when it
+// has a choice of document. It is deliberately small and transport-agnostic:
+// it carries no endpoint or document information into logs or callers.
+type LaneHealth struct {
+	Connected     bool
+	QueueLoad     float64
+	RTT           time.Duration
+	WriteFailures uint64
+}
+
+// LaneHealthReporter is implemented by transports that can expose their
+// current queue pressure and observed control-plane RTT.
+type LaneHealthReporter interface {
+	LaneHealth() LaneHealth
+}
+
 func DefaultConfig() TransportConfig {
 	return TransportConfig{
 		MaxReconnectAttempts: 999999,

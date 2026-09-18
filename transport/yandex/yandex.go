@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	urlpkg "net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -109,6 +110,13 @@ type YandexDocsTransport struct {
 	generation       atomic.Uint64
 	failedAttempts   atomic.Int32
 	captchaUntil     atomic.Int64
+	// A document may accept editor authentication and then repeatedly close the
+	// WebSocket with 1005. Normal reconnect backoff is reset after a successful
+	// peer proof, so it cannot recognise that pattern. Keep a lane-local circuit
+	// breaker while a healthy sibling document remains usable.
+	peerReadyAt      atomic.Int64
+	shortFailures    atomic.Int32
+	circuitOpenUntil atomic.Int64
 
 	// retryQueue owns batches that a writer had already removed from the
 	// session queue when its WebSocket write failed.  Keeping this outside a
@@ -141,7 +149,34 @@ const batchCoalesceDelay = 500 * time.Microsecond
 const maxQueuedPacketAge = 12 * time.Second
 const maxPendingProofs = 8
 
+const (
+	shortSessionWindow    = 60 * time.Second
+	shortFailureThreshold = 3
+	circuitCooldownBase   = 30 * time.Second
+	circuitCooldownMax    = 2 * time.Minute
+)
+
+// These switches are intentionally process-local: client and exit may be
+// tested independently without changing framing compatibility. They make a
+// reproducible A/B possible on an otherwise identical worker. Bounds protect
+// the editor endpoint from oversized cursor messages.
+var configuredBatchMaxPayload = func() int {
+	if kb, err := strconv.Atoi(os.Getenv("PAPERFLUX_BATCH_KB")); err == nil && kb >= 16 && kb <= 64 {
+		return kb << 10
+	}
+	return batchMaxPayload
+}()
+var configuredWebSocketCompression = os.Getenv("PAPERFLUX_WS_COMPRESSION") != "0"
+
 var yandexBatchPool = sync.Pool{New: func() interface{} { return make([]byte, 0, batchMaxPayload) }}
+
+// The writer builds a short list of packets belonging to the current cursor
+// frame.  Reuse that bookkeeping slice on successful writes: on mobile a
+// stream of small TCP packets otherwise makes the garbage collector work far
+// more often than the actual encryption does.  A slice that is handed to the
+// retry queue is intentionally not returned here; the queue owns it until the
+// retry succeeds or expires.
+var yandexPacketBatchPool = sync.Pool{New: func() interface{} { return make([]queuedPacket, 0, 32) }}
 var cursorBase64RE = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
 
 // Channel tag isolates this deployment from older/public OpenFlux clients
@@ -189,6 +224,7 @@ func (t *YandexDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
+	log.Printf("[PAPERFLUX_TUNING] batch_kb=%d ws_compression=%t", configuredBatchMaxPayload>>10, configuredWebSocketCompression)
 	// Some legacy OnlyOffice balancers close an otherwise healthy Engine.IO
 	// session after ~30 seconds unless the editor channel itself sees activity.
 	// This marker is ignored by handleMessage and carries no user data.
@@ -415,7 +451,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			// Yandex's WebSocket endpoint supports per-message deflate. This
 			// reduces JSON/Base64 framing overhead without changing the wire
 			// payload or the Engine.IO/Socket.IO protocol.
-			EnableCompression: true,
+			EnableCompression: configuredWebSocketCompression,
 		}
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
@@ -455,6 +491,18 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		t.Mu.Lock()
 		if existingSession != nil {
 			existingSession.retire()
+		}
+		// A WebSocket replacement is a new physical document path even when the
+		// PFS2 key pair survives it. Do not let a proof from the retired socket
+		// authorise data on this one: both peers must first acknowledge a fresh
+		// liveness challenge on the newly published editor session.
+		t.resetPeerReadiness()
+		if err := t.secure.rotateEpoch(); err != nil {
+			t.Mu.Unlock()
+			session.retire()
+			log.Printf("[PAPERFLUX] secure epoch rotation failed: %v", err)
+			t.scheduleReconnect(attempt)
+			return
 		}
 		t.session = session
 		t.Mu.Unlock()
@@ -536,10 +584,6 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			}
 			if isSuccessfulAuth(message) && !t.IsConnected() {
 				t.SetConnected(true)
-				// A real editor-auth response means the namespace is live; future
-				// reconnects can start from the short retry delay again.
-				t.failedAttempts.Store(0)
-				t.captchaUntil.Store(0)
 				log.Printf("[PAPERFLUX] YANDEX_AUTH_OK (reply in %s; total %s)", time.Since(authSentAt).Round(time.Millisecond), time.Since(attemptStarted).Round(time.Millisecond))
 				// Start PFS2 immediately. The former 10-second keepalive tick made
 				// first authentication unnecessarily slow, and could compound over
@@ -639,7 +683,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 			}
 		}
 		if t.peerReady.Load() && time.Since(time.Unix(0, t.lastProof.Load())) > 20*time.Second {
-			t.peerReady.Store(false)
+			t.resetPeerReadiness()
 			log.Printf("[PAPERFLUX] PEER_LOST: no authenticated response for 20s")
 		}
 		// Empty editor cursor frames are only needed when the channel has been
@@ -667,6 +711,53 @@ func (t *YandexDocsTransport) isCurrentSession(session *DocSession) bool {
 	t.Mu.RLock()
 	defer t.Mu.RUnlock()
 	return t.session == session
+}
+
+// resetPeerReadiness invalidates only the physical-path confirmation. The
+// cryptographic channel may retain its keys across a short document rotation,
+// but user data must wait until the replacement WebSocket has carried a new
+// authenticated proof exchange.
+func (t *YandexDocsTransport) resetPeerReadiness() {
+	t.peerReady.Store(false)
+	t.lastProof.Store(0)
+	t.peerReadyAt.Store(0)
+	t.proofMu.Lock()
+	clear(t.pendingProof)
+	t.proofMu.Unlock()
+}
+
+// shortFailureCooldown returns an extra pause for a document which repeatedly
+// drops soon after its encrypted path becomes ready. It is independent from
+// failedAttempts, which intentionally resets after a normal successful proof.
+func (t *YandexDocsTransport) shortFailureCooldown(now time.Time) time.Duration {
+	readyAtNanos := t.peerReadyAt.Load()
+	if readyAtNanos == 0 {
+		return 0
+	}
+	age := now.Sub(time.Unix(0, readyAtNanos))
+	if age < 0 || age >= shortSessionWindow {
+		t.shortFailures.Store(0)
+		t.circuitOpenUntil.Store(0)
+		return 0
+	}
+
+	failures := t.shortFailures.Add(1)
+	if failures < shortFailureThreshold {
+		return 0
+	}
+	shift := min(int(failures-shortFailureThreshold), 2)
+	cooldown := circuitCooldownBase * time.Duration(1<<shift)
+	if cooldown > circuitCooldownMax {
+		cooldown = circuitCooldownMax
+	}
+	until := now.Add(cooldown).UnixNano()
+	for {
+		previous := t.circuitOpenUntil.Load()
+		if previous >= until || t.circuitOpenUntil.CompareAndSwap(previous, until) {
+			break
+		}
+	}
+	return cooldown
 }
 
 // startSecureSession sends the PFS2 hello as soon as editor auth completes.
@@ -788,7 +879,7 @@ func (t *YandexDocsTransport) writerLoop() {
 		session := t.session
 		t.Mu.RUnlock()
 
-		if session == nil || session.Conn == nil || !t.IsConnected() || !t.secure.ready() {
+		if session == nil || session.Conn == nil || !t.IsConnected() || !t.secure.ready() || !t.peerReady.Load() {
 			time.Sleep(25 * time.Millisecond)
 			continue
 		}
@@ -857,7 +948,7 @@ func (t *YandexDocsTransport) writerLoop() {
 				payload = append(payload, p...)
 				return true
 			}
-			encodedItems := make([]queuedPacket, 0, len(items)+8)
+			encodedItems := yandexPacketBatchPool.Get().([]queuedPacket)[:0]
 			for index, item := range items {
 				if appendPacket(item) {
 					encodedItems = append(encodedItems, item)
@@ -872,6 +963,7 @@ func (t *YandexDocsTransport) writerLoop() {
 			}
 			if len(encodedItems) == 0 {
 				t.requeueBatch(items)
+				yandexPacketBatchPool.Put(encodedItems[:0])
 				yandexBatchPool.Put(payload[:0])
 				continue
 			}
@@ -952,6 +1044,9 @@ func (t *YandexDocsTransport) writerLoop() {
 				for _, item := range encodedItems {
 					t.dequeuePacket(item)
 				}
+				if cap(encodedItems) <= 128 {
+					yandexPacketBatchPool.Put(encodedItems[:0])
+				}
 			}
 			if cap(frame) <= 64<<10 {
 				yandexFramePool.Put(frame[:0])
@@ -975,18 +1070,41 @@ func (t *YandexDocsTransport) QueueLoad() float64 {
 	return float64(len(session.WriteQueue)) / float64(cap(session.WriteQueue))
 }
 
+// LaneHealth gives MultiTransport enough information to route a new bonded
+// packet without exposing the document URL or session identity. Queue pressure
+// is a better immediate signal than a historical round-robin counter; the
+// Engine.IO ping is used only as a secondary tie-breaker.
+func (t *YandexDocsTransport) LaneHealth() transport.LaneHealth {
+	t.Mu.RLock()
+	session := t.session
+	t.Mu.RUnlock()
+	health := transport.LaneHealth{Connected: t.IsConnected(), WriteFailures: t.writeFailures.Load()}
+	if session == nil {
+		return health
+	}
+	if capacity := cap(session.WriteQueue); capacity > 0 {
+		health.QueueLoad = float64(len(session.WriteQueue)) / float64(capacity)
+	}
+	if ping := session.pingMs.Load(); ping > 0 {
+		health.RTT = time.Duration(ping) * time.Millisecond
+	}
+	return health
+}
+
 func (t *YandexDocsTransport) batchPayloadLimit(session *DocSession) int {
+	maxPayload := configuredBatchMaxPayload
+	minPayload := max(batchMinPayload, maxPayload/2)
 	if session == nil || cap(session.WriteQueue) == 0 {
-		return batchMaxPayload
+		return maxPayload
 	}
 	load := float64(len(session.WriteQueue)) / float64(cap(session.WriteQueue))
 	switch {
 	case load >= 0.75:
-		return batchMinPayload
+		return minPayload
 	case load >= 0.50:
-		return (batchMaxPayload + batchMinPayload) / 2
+		return (maxPayload + minPayload) / 2
 	default:
-		return batchMaxPayload
+		return maxPayload
 	}
 }
 
@@ -1104,6 +1222,9 @@ func enginePollingURL(wsURL string) (string, error) {
 }
 
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
+	if session == nil || !t.isCurrentSession(session) {
+		return
+	}
 	text := string(data)
 	if reason, ok := disconnectReasonSummary(data); ok {
 		// Yandex may send disconnectReason (most commonly 4007/drop) before
@@ -1112,7 +1233,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		// queued writes target a socket which the editor has already retired.
 		log.Printf("[PAPERFLUX] Yandex requested session close: %s", reason)
 		t.SetConnected(false)
-		t.peerReady.Store(false)
+		t.resetPeerReadiness()
 		if session != nil && t.isCurrentSession(session) {
 			session.expectedClose.Store(true)
 			session.retire()
@@ -1128,9 +1249,6 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		// service still exposes the VPN only after the separate encrypted peer and
 		// DNS/TCP checks succeed.
 		t.SetConnected(true)
-		// waitAuth is already a live editor session. Do not let a later normal
-		// 4007/drop inherit a backoff accumulated before this connection.
-		t.failedAttempts.Store(0)
 		log.Printf("[PAPERFLUX] YANDEX_WAIT_AUTH: editor session is live; awaiting collaborative lock")
 		t.startSecureSession(session, true)
 		return
@@ -1257,6 +1375,13 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 					session.pingMs.Store(rtt)
 				}
 				if !t.peerReady.Swap(true) {
+					t.peerReadyAt.Store(time.Now().UnixNano())
+					// Reset reconnect backoff only after both the editor session and
+					// the encrypted peer path are proven. An auth reply followed by
+					// an immediate 1005 must still back off instead of churning the
+					// document participant every 1.5 seconds.
+					t.failedAttempts.Store(0)
+					t.captchaUntil.Store(0)
 					log.Printf("[PAPERFLUX] PEER_READY: encrypted exit channel confirmed")
 				}
 			}
@@ -1435,6 +1560,7 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 
 	t.RecordReconnect()
 	_ = attempt // Attempts are tracked centrally so concurrent failures coalesce.
+	cooldown := t.shortFailureCooldown(time.Now())
 	failed := t.failedAttempts.Add(1)
 	base := t.GetConfig().ReconnectDelay
 	if base < 1500*time.Millisecond {
@@ -1451,6 +1577,10 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	}
 	if delay > 0 {
 		delay += time.Duration(rand.Int63n(int64(delay/4) + 1))
+	}
+	if cooldown > delay {
+		delay = cooldown
+		log.Printf("[PAPERFLUX] document lane cooling down after short reconnects: %s", cooldown)
 	}
 	if until := time.Unix(0, t.captchaUntil.Load()); until.After(time.Now()) {
 		delay = time.Until(until)
