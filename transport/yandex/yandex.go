@@ -43,18 +43,23 @@ type YandexDocsInfo struct {
 }
 
 type DocSession struct {
-	Info         YandexDocsInfo
-	Conn         *websocket.Conn
-	WriteQueue   chan queuedPacket
-	UserID       string
-	done         chan struct{}
-	retireOnce   sync.Once
-	writeMu      sync.Mutex
-	diagFrames   atomic.Uint32
-	diagSecure   atomic.Uint32
-	pingMs       atomic.Int64
-	lastPing     atomic.Int64
-	lastActivity atomic.Int64
+	Info          YandexDocsInfo
+	Conn          *websocket.Conn
+	WriteQueue    chan queuedPacket
+	UserID        string
+	done          chan struct{}
+	retireOnce    sync.Once
+	writeMu       sync.Mutex
+	diagFrames    atomic.Uint32
+	diagSecure    atomic.Uint32
+	pingMs        atomic.Int64
+	lastPing      atomic.Int64
+	lastActivity  atomic.Int64
+	createdAt     time.Time
+	readyAt       atomic.Int64
+	proofAt       atomic.Int64
+	authConfirmed atomic.Bool
+	cachedInfo    bool
 	// Set for an editor-requested rotation. Its subsequent ReadMessage error
 	// is expected, so it must not be treated as a second failure.
 	expectedClose atomic.Bool
@@ -82,7 +87,19 @@ func (s *DocSession) retire() {
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.Conn.WriteMessage(messageType, data)
+	select {
+	case <-s.done:
+		return net.ErrClosed
+	default:
+	}
+	if err := s.Conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return err
+	}
+	err := s.Conn.WriteMessage(messageType, data)
+	if err == nil {
+		s.lastActivity.Store(time.Now().UnixNano())
+	}
+	return err
 }
 
 type YandexDocsTransport struct {
@@ -110,6 +127,9 @@ type YandexDocsTransport struct {
 	generation       atomic.Uint64
 	failedAttempts   atomic.Int32
 	captchaUntil     atomic.Int64
+	bootstrapMu      sync.Mutex
+	bootstrapInfo    YandexDocsInfo
+	bootstrapAt      time.Time
 	// A document may accept editor authentication and then repeatedly close the
 	// WebSocket with 1005. Normal reconnect backoff is reset after a successful
 	// peer proof, so it cannot recognise that pattern. Keep a lane-local circuit
@@ -148,6 +168,9 @@ const maxLaneQueuePackets = 2048
 const batchCoalesceDelay = 500 * time.Microsecond
 const maxQueuedPacketAge = 12 * time.Second
 const maxPendingProofs = 8
+const bootstrapCacheAge = 90 * time.Minute
+const editorAuthTimeout = 60 * time.Second
+const protectedPathTimeout = 45 * time.Second
 
 const (
 	shortSessionWindow    = 60 * time.Second
@@ -314,7 +337,6 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	case session.WriteQueue <- queuedPacket{data: data, queuedAt: time.Now()}:
 		t.queuedPackets.Add(1)
 		t.queuedBytes.Add(uint64(len(data)))
-		session.lastActivity.Store(time.Now().UnixNano())
 		t.RecordSend(len(data))
 		return nil
 	default:
@@ -431,7 +453,11 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		suffix := fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
 		userID := t.baseUserID + suffix
 
-		info, err := t.fetchDocInfoRetry(userID)
+		info, cached := t.cachedDocInfo(userID)
+		var err error
+		if !cached {
+			info, err = t.fetchDocInfoRetry(userID)
+		}
 		if err != nil {
 			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
 			log.Printf("[PAPERFLUX] document bootstrap failed: %v", err)
@@ -461,6 +487,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		conn, err := connectEngineIO(info.WsURL, headers, &dialer)
 		if err != nil {
+			if cached && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "403")) {
+				t.invalidateDocInfo()
+			}
 			utils.Debugf("[YDOCS] Engine.IO connect failed: %v", err)
 			log.Printf("[PAPERFLUX] Engine.IO upgrade failed: %v", err)
 			t.scheduleReconnect(attempt)
@@ -484,6 +513,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			WriteQueue: writeQueue,
 			UserID:     userID,
 			done:       make(chan struct{}),
+			createdAt:  time.Now(),
+			cachedInfo: cached,
 		}
 
 		// Retire the previous reader before publishing the replacement. Without
@@ -578,17 +609,27 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				t.scheduleReconnect(attempt)
 				return
 			}
+			// A retired reader can still return one buffered frame after the
+			// replacement is published. It must not mark that new session ready
+			// or overwrite its bootstrap cache.
+			if !t.isCurrentSession(session) {
+				return
+			}
 			frameNo := session.diagFrames.Add(1)
 			if frameNo <= 12 || (bytes.Contains(message, []byte(`"auth"`)) || bytes.Contains(message, []byte(`authChanges`))) {
 				log.Printf("[PAPERFLUX] Yandex frame #%d type=%s bytes=%d", frameNo, yandexFrameLabel(message), len(message))
 			}
-			if isSuccessfulAuth(message) && !t.IsConnected() {
-				t.SetConnected(true)
-				log.Printf("[PAPERFLUX] YANDEX_AUTH_OK (reply in %s; total %s)", time.Since(authSentAt).Round(time.Millisecond), time.Since(attemptStarted).Round(time.Millisecond))
-				// Start PFS2 immediately. The former 10-second keepalive tick made
-				// first authentication unnecessarily slow, and could compound over
-				// a reconnect when both endpoints were waiting for their next tick.
-				t.startSecureSession(session, true)
+			if isSuccessfulAuth(message) {
+				session.readyAt.CompareAndSwap(0, time.Now().UnixNano())
+				if !session.cachedInfo && session.authConfirmed.CompareAndSwap(false, true) {
+					t.cacheDocInfo(session.Info)
+				}
+				if !t.IsConnected() {
+					t.SetConnected(true)
+					log.Printf("[PAPERFLUX] YANDEX_AUTH_OK (reply in %s; total %s)", time.Since(authSentAt).Round(time.Millisecond), time.Since(attemptStarted).Round(time.Millisecond))
+					// Start PFS2 immediately after editor auth.
+					t.startSecureSession(session, true)
+				}
 			}
 			t.handleMessage(session, message)
 			session.lastActivity.Store(time.Now().UnixNano())
@@ -611,6 +652,40 @@ func (t *YandexDocsTransport) fetchDocInfoRetry(userID string) (YandexDocsInfo, 
 		time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
 	}
 	return YandexDocsInfo{}, last
+}
+
+// Reuse a successfully authenticated editor bootstrap for normal document
+// rotations. Fetching the public document page for every short-lived socket
+// consumes a new HTTP session and can lead to an IP-wide CAPTCHA challenge.
+// The cache is process-local, bounded, and discarded after an auth rejection.
+func (t *YandexDocsTransport) cachedDocInfo(userID string) (YandexDocsInfo, bool) {
+	t.bootstrapMu.Lock()
+	defer t.bootstrapMu.Unlock()
+	if t.bootstrapAt.IsZero() || time.Since(t.bootstrapAt) >= bootstrapCacheAge {
+		return YandexDocsInfo{}, false
+	}
+	info := t.bootstrapInfo
+	info.UserID = userID
+	info.OpenCmd = make(map[string]interface{}, len(t.bootstrapInfo.OpenCmd))
+	for key, value := range t.bootstrapInfo.OpenCmd {
+		info.OpenCmd[key] = value
+	}
+	info.OpenCmd["userid"] = userID
+	return info, true
+}
+
+func (t *YandexDocsTransport) cacheDocInfo(info YandexDocsInfo) {
+	t.bootstrapMu.Lock()
+	t.bootstrapInfo = info
+	t.bootstrapAt = time.Now()
+	t.bootstrapMu.Unlock()
+}
+
+func (t *YandexDocsTransport) invalidateDocInfo() {
+	t.bootstrapMu.Lock()
+	t.bootstrapInfo = YandexDocsInfo{}
+	t.bootstrapAt = time.Time{}
+	t.bootstrapMu.Unlock()
 }
 
 func isTransientBootstrapError(err error) bool {
@@ -673,6 +748,24 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 		if session == nil || session.Conn == nil {
 			continue
 		}
+		select {
+		case <-session.done:
+			continue
+		default:
+		}
+		if !t.isCurrentSession(session) {
+			continue
+		}
+		if reason := sessionStallReason(session, time.Now(), !t.exitRole); reason != "" {
+			log.Printf("[PAPERFLUX] document session stalled: %s", reason)
+			if session.cachedInfo && session.readyAt.Load() == 0 {
+				t.invalidateDocInfo()
+			}
+			session.retire()
+			t.SetConnected(false)
+			t.scheduleReconnect(0)
+			continue
+		}
 		if t.IsConnected() {
 			// PFS2 is started immediately on editor auth. The periodic worker only
 			// repairs a missed handshake and sends a lightweight authenticated
@@ -699,10 +792,37 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 			}
 			log.Printf("[PAPERFLUX] editor keepalive failed: %v", err)
 			t.SetConnected(false)
-			_ = session.Conn.Close()
+			session.retire()
 			t.scheduleReconnect(0)
 		}
 	}
+}
+
+// A live Engine.IO socket can continue answering pings while the encrypted
+// peer path is dead. Bound both editor authentication and peer proof waiting.
+func sessionStallReason(session *DocSession, now time.Time, requirePeer bool) string {
+	if session == nil || session.expectedClose.Load() {
+		return ""
+	}
+	if authAt := session.readyAt.Load(); authAt > 0 {
+		// An exit node may be started before its Android peer. Keep its editor
+		// socket available instead of reloading the document every 45 seconds.
+		if !requirePeer {
+			return ""
+		}
+		lastProof := session.proofAt.Load()
+		if lastProof > authAt {
+			authAt = lastProof
+		}
+		if now.Sub(time.Unix(0, authAt)) > protectedPathTimeout {
+			return "no authenticated peer proof"
+		}
+		return ""
+	}
+	if !session.createdAt.IsZero() && now.Sub(session.createdAt) > editorAuthTimeout {
+		return "editor authentication timed out"
+	}
+	return ""
 }
 
 // isCurrentSession prevents a late reader/writer from an already retired
@@ -1249,6 +1369,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		// service still exposes the VPN only after the separate encrypted peer and
 		// DNS/TCP checks succeed.
 		t.SetConnected(true)
+		session.readyAt.CompareAndSwap(0, time.Now().UnixNano())
 		log.Printf("[PAPERFLUX] YANDEX_WAIT_AUTH: editor session is live; awaiting collaborative lock")
 		t.startSecureSession(session, true)
 		return
@@ -1259,6 +1380,13 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		// Log only the small, non-secret reason fields; never expose refresh
 		// tokens, document links, cookies, or the complete editor payload.
 		log.Printf("[PAPERFLUX] Yandex editor rejected auth: %s", editorErrorSummary(data))
+		if session.readyAt.Load() == 0 {
+			t.invalidateDocInfo()
+			session.retire()
+			t.SetConnected(false)
+			t.scheduleReconnect(0)
+			return
+		}
 	}
 	if strings.Contains(text, `"type":"paperfluxIdentity"`) {
 		log.Printf("[PAPERFLUX] peer profile identity received")
@@ -1372,6 +1500,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 			if valid {
 				t.lastProof.Store(time.Now().UnixNano())
 				if session != nil {
+					session.proofAt.Store(time.Now().UnixNano())
 					session.pingMs.Store(rtt)
 				}
 				if !t.peerReady.Swap(true) {
@@ -1623,6 +1752,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		ResponseHeaderTimeout: 15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	defer transportHTTP.CloseIdleConnections()
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if strings.Contains(req.URL.Path, "showcaptcha") {
