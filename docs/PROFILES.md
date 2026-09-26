@@ -1,0 +1,106 @@
+# Профили и выдача конфигурации
+
+В Android 0.4.15 ручное добавление требует три поля: название, IP или домен сервера и пароль профиля. Приложение получает ID, транспорт, виртуальный IP и ссылки на документы с этого сервера. Пароль профиля — случайный ключ доступа, совпадающий с `--profile-token` exit-node, не SSH/root-пароль VPS.
+
+Выдача конфигурации — отдельный необязательный сервис. Он работает на любом PaperFlux-сервере, не зависит от Telegram-бота и не передаёт VPN-трафик. Без него остаётся импорт полной конфигурации через QR, ссылку или файл.
+
+## Сборка
+
+Готовые бинарники `PaperFlux-Profile-Service-v0.5.7-linux-amd64` и `PaperFlux-Profile-Service-v0.5.7-linux-arm64` доступны в серверном релизе. Выберите архитектуру VPS и установите выбранный файл как `/usr/local/bin/paperflux-profile-service`. Сборка из исходников описана ниже.
+
+Из корня серверного репозитория:
+
+```bash
+go build -trimpath -o paperflux-profile-service ./cmd/paperflux-profile-service
+sudo install -m 0755 paperflux-profile-service /usr/local/bin/paperflux-profile-service
+```
+
+Собирать нужно под архитектуру VPS. Используйте отдельного непривилегированного пользователя `paperflux`, как в [инструкции развёртывания](DEPLOYMENT.md), либо укажите своего пользователя в командах и unit-файле ниже.
+
+## Источник профилей
+
+```bash
+sudo install -d -o paperflux -g paperflux -m 0700 /var/lib/paperflux-profiles
+sudo install -o paperflux -g paperflux -m 0600 /dev/null /var/lib/paperflux-profiles/profiles.json
+sudoedit /var/lib/paperflux-profiles/profiles.json
+```
+
+Файл содержит массив профилей. Значения должны совпадать с конфигурацией работающего exit-node:
+
+```json
+[
+  {
+    "id": "1",
+    "name": "Основной",
+    "token": "REPLACE_WITH_RANDOM_PROFILE_ACCESS_KEY",
+    "clientIp": "10.10.10.2",
+    "transport": "yandex",
+    "documentUrls": ["https://disk.yandex.ru/i/YOUR_DOCUMENT"]
+  }
+]
+```
+
+Для двух каналов добавьте вторую ссылку в `documentUrls`. Допустимые транспорты: `yandex`, `vyandex`, `cupsonline`, `mailru`. Для Cups передайте текущую строку комнат, выданную сервером, а не ссылку на сайт. Сервис не создаёт exit-node и не меняет его параметры.
+
+Ключи должны быть уникальными, случайными и длиной 32–128 символов. Например, `openssl rand -hex 32` создаёт новый ключ; тот же ключ необходимо задать exit-node. Короткие человеческие пароли использовать нельзя: протокол не предназначен для защиты слабых паролей от перебора.
+
+JSON не публикуется в репозитории и недоступен через HTTP. Сервис отказывается читать файл с групповым или общим доступом. Для обновления заменяйте файл атомарно, сохраняя владельца и права `0600`; изменения учитываются при следующем запросе. Отзыв доступа к VPN требует также смены ключа или отключения соответствующего exit-node.
+
+## Запуск через systemd
+
+Создайте `/etc/systemd/system/paperflux-profile-service.service`:
+
+```ini
+[Unit]
+Description=PaperFlux encrypted profile discovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=paperflux
+Group=paperflux
+ExecStart=/usr/local/bin/paperflux-profile-service --listen=0.0.0.0:24000 --profiles=/var/lib/paperflux-profiles/profiles.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+MemoryMax=96M
+TasksMax=64
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now paperflux-profile-service
+sudo systemctl status paperflux-profile-service
+```
+
+Разрешите входящий TCP-порт **24000** в используемом firewall и панели провайдера. Не отключайте firewall целиком. Android обращается к этому порту на адресе, введённом пользователем. Выбирайте адрес, достижимый до подключения VPN.
+
+## Защита обмена
+
+Ключ не передаётся открытым текстом. Протокол PFPC1 проверяет HMAC-SHA-256 на свежих случайных значениях клиента и сервера; ответ шифруется AES-256-GCM и привязан к этому обмену. Подмена ответа отклоняется. На соединение установлен таймаут, число параллельных запросов и повторов с одного IP ограничено. Это сервис выдачи одного профиля по его ключу, а не публичный список профилей или резервный прокси.
+
+## Необязательная интеграция с менеджером
+
+Если профили уже хранятся в SQLite менеджера PaperFlux, можно обновлять приватный JSON скриптом:
+
+```bash
+sudo python3 scripts/export-bot-profiles.py \
+  --database=/path/to/paperflux-bot.db \
+  --output=/var/lib/paperflux-profiles/profiles.json \
+  --owner=paperflux --watch
+```
+
+Экспортёр читает базу в режиме read-only и обновляет JSON каждые 10 секунд. Для постоянной работы запускайте его отдельным systemd-сервисом с правом читать базу и записывать только каталог профилей. Telegram-доступ или наличие бота не требуются. Профили с общими документами не дублируются: используется первый профиль по ID, как при назначении владельца ресурса менеджером.
+
+## Добавление и обмен в Android
+
+В «Профили → Добавить профиль» введите название, адрес сервера и ключ профиля. Остальные параметры загружаются автоматически; тип транспорта сохраняется таким, каким его выдал сервер. Уже добавленный профиль можно переименовать без повторного ввода ключа.
+
+В карточке профиля «Поделиться» открывает QR-код, копирование ссылки и системную отправку ссылки или изображения QR. QR создаётся на устройстве. Конфигурация содержит ключ доступа: отправляйте её только доверенному получателю; cookies и данные проверки Яндекса в неё не входят. Для разных пользователей выдавайте отдельные профили. Профили с одинаковым ID на разных серверах хранятся отдельно.

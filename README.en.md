@@ -36,12 +36,13 @@ Session supports one or two Yandex documents. TCP flows use available document l
 
 The primary configuration is PaperFlux Android with a compatible PaperFlux server over Yandex Docs. The current path targets IPv4/TCP; general UDP and IPv6 support are not advertised.
 
-Server 0.5.6 and Android 0.4.14 require `--session` on the server. Update both sides; legacy PFS2 clients are not compatible with Session. Yandex Volga, Cups.online and Mail.ru Docs are available as separate transports. Volga requires an empty document because it modifies its content. An optional encrypted verification-only channel helps with server-side Yandex CAPTCHA without carrying normal VPN traffic.
+Server 0.5.6–0.5.7 and Android 0.4.14–0.4.15 use compatible Session protocols and require `--session` on the server. Legacy PFS2 clients are not compatible with Session. Android 0.4.15 address-and-key setup requires the optional profile discovery service; complete profile import does not. Yandex Volga, Cups.online and Mail.ru Docs are available as separate transports. Volga requires an empty document because it modifies its content. An optional encrypted verification-only channel helps with server-side Yandex CAPTCHA without carrying normal VPN traffic.
 
 Linux `amd64` and `arm64` binaries are available in the [latest release](https://github.com/Flofyyk/PaperFlux/releases/latest). `uname -m` reports `x86_64` for amd64 and `aarch64` for arm64.
 
 - [Linux VPS deployment](docs/DEPLOYMENT.md) (Russian)
 - [Android profiles and connection](docs/PAPERFLUX.md) (Russian)
+- [Profile discovery and sharing](docs/PROFILES.md) (Russian) — optional encrypted setup by server address and access key, independent of any bot or VPS provider.
 - [PFS2 protocol](docs/SECURITY_PFS2.md) (Russian)
 - [Transports and Yandex verification](docs/TRANSPORTS.md) (Russian)
 

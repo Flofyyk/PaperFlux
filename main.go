@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	buildVersion = "0.5.6-session"
+	buildVersion = "0.5.7-session"
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
