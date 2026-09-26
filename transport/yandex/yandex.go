@@ -2,6 +2,7 @@ package yandex
 
 import (
 	"bytes"
+	"context"
 	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -13,7 +14,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	urlpkg "net/url"
 	"os"
 	"regexp"
@@ -153,6 +153,12 @@ type YandexDocsTransport struct {
 	// tunnel therefore disables per-lane reporting and reports its aggregate
 	// from MultiTransport instead.
 	statsLogging atomic.Bool
+	// Authentication cookies survive document reconnects. Stop cancels page loads
+	// and bounded proof-of-work rather than waiting for an HTTP timeout.
+	authMu     sync.Mutex
+	authCtx    context.Context
+	authCancel context.CancelFunc
+	cookieJar  http.CookieJar
 }
 
 type pendingProof struct {
@@ -228,6 +234,7 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig, identi
 	t.failedAttempts.Store(0)
 	t.captchaUntil.Store(0)
 	t.statsLogging.Store(true)
+	t.authCtx, t.authCancel = context.WithCancel(context.Background())
 	return t
 }
 
@@ -236,6 +243,11 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig, identi
 func (t *YandexDocsTransport) SetStatsLogging(enabled bool) { t.statsLogging.Store(enabled) }
 
 func (t *YandexDocsTransport) Start() error {
+	t.authMu.Lock()
+	if t.authCtx == nil || t.authCtx.Err() != nil {
+		t.authCtx, t.authCancel = context.WithCancel(context.Background())
+	}
+	t.authMu.Unlock()
 	t.generation.Add(1)
 	var err error
 	t.secure, err = newSecureChannel(t.profileID, t.profileToken, t.url, t.exitRole)
@@ -264,6 +276,11 @@ func (t *YandexDocsTransport) Start() error {
 // Closing only BaseTransport used to leave a reader blocked in ReadMessage and
 // let a late write from that retired session race a later Start.
 func (t *YandexDocsTransport) Stop() error {
+	t.authMu.Lock()
+	if t.authCancel != nil {
+		t.authCancel()
+	}
+	t.authMu.Unlock()
 	t.generation.Add(1)
 	_ = t.BaseTransport.Stop()
 	t.reconnectPending.Store(false)
@@ -1744,53 +1761,7 @@ func (t *YandexDocsTransport) scheduleRotationReconnect() {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
-	captchaRedirect := false
-	transportHTTP := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	defer transportHTTP.CloseIdleConnections()
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if strings.Contains(req.URL.Path, "showcaptcha") {
-				captchaRedirect = true
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
-		Timeout:   35 * time.Second,
-		Transport: transportHTTP,
-	}
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return YandexDocsInfo{}, fmt.Errorf("cookie jar: %w", err)
-	}
-	client.Jar = jar
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return YandexDocsInfo{}, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return YandexDocsInfo{}, err
-	}
-	defer resp.Body.Close()
-	if captchaRedirect || resp.Header.Get("X-Yandex-Captcha") != "" || strings.Contains(resp.Request.URL.Path, "showcaptcha") {
-		// This is not a transport failure.  Leave the IP alone for a while rather
-		// than turning the challenge into hundreds of repeated requests.
-		t.captchaUntil.Store(time.Now().Add(10 * time.Minute).UnixNano())
-		return YandexDocsInfo{}, errCaptchaChallenge
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return YandexDocsInfo{}, fmt.Errorf("document request returned HTTP %d", resp.StatusCode)
-	}
-
-	htmlBytes, err := io.ReadAll(resp.Body)
+	htmlBytes, resp, jar, err := t.authDocument(url)
 	if err != nil {
 		return YandexDocsInfo{}, err
 	}
@@ -1811,7 +1782,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		cookies = append(cookies, fmt.Sprintf("%s=%s", name, value))
 	}
 
-	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
+	re := regexp.MustCompile(`(?s)<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 	matches := re.FindStringSubmatch(html)
 	if len(matches) < 2 {
 		return YandexDocsInfo{}, fmt.Errorf("config not found")
@@ -1824,6 +1795,9 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	officeAction, ok := config["officeActionData"].(map[string]interface{})
 	if !ok || officeAction == nil {
 		return YandexDocsInfo{}, fmt.Errorf("officeActionData missing")
+	}
+	if editor, _ := officeAction["office_online_editor_type"].(string); editor == "volga" {
+		return YandexDocsInfo{}, errVolgaDocument
 	}
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})

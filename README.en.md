@@ -9,7 +9,7 @@ Based on [OpenFlux](https://github.com/p1neappleXpress/OpenFlux), this repositor
 ## How it works
 
 ```text
-Android apps ↔ VPN/TCP stack ↔ PFS2
+Android apps ↔ VPN/TCP stack ↔ Session / legacy PFS2
                                  ↕
                   Yandex Docs collaboration channel
                                  ↕
@@ -20,23 +20,30 @@ The Android client processes VPN-interface packets through a local network stack
 
 Both endpoints join the same Yandex document. The transport batches and encrypts data, then encodes it inside cursor messages sent through Socket.IO over Engine.IO/WebSocket. Packet content does not need to be written into the document text.
 
-The VPS decodes these messages and forwards TCP packets using raw sockets. Responses follow the reverse path.
+The VPS decodes these messages and forwards TCP traffic. The `proxy` mode uses ordinary outbound sockets without root; `raw` retains packet forwarding with Linux-specific setup. Responses follow the reverse path.
 
 ## Secure sessions and recovery
 
-PFS2 authenticates peers using profile credentials, exchanges keys with X25519 and encrypts messages with AES-256-GCM. Application data is accepted only after session confirmation. Encryption covers the client-to-VPS path; protection beyond the VPS depends on the application's protocol, such as HTTPS.
+The current Session authenticates peers with profile credentials, negotiates capabilities and encrypts messages with directional AES-256-GCM. Legacy PFS2 with X25519 remains a separate compatibility mode. Application data is accepted only after session confirmation. Encryption covers the client-to-VPS path; protection beyond the VPS depends on the application's protocol, such as HTTPS.
 
 The document service can observe message timing and sizes. See [PFS2](docs/SECURITY_PFS2.md) for details.
 
 Connection readiness requires document authentication, a secure peer session and DNS/TCP verification. After a disconnect, the transport fetches document parameters again and creates a fresh WebSocket session. Retries use exponential delays with jitter; expired queued packets are discarded.
 
+Session supports one or two Yandex documents. TCP flows use available document lanes; losing one lane does not require replacing the entire VPN. Restarted exit nodes are rediscovered using a fresh challenge before peer replacement. Restored lanes trigger immediate Android DNS/TCP verification. Collaborative editor authentication locks are completed without changing document content.
+
 ## Compatibility and documentation
 
 The primary configuration is PaperFlux Android with a compatible PaperFlux server over Yandex Docs. The current path targets IPv4/TCP; general UDP and IPv6 support are not advertised.
 
+Server 0.5.6 and Android 0.4.14 require `--session` on the server. Update both sides; legacy PFS2 clients are not compatible with Session. Yandex Volga, Cups.online and Mail.ru Docs are available as separate transports. Volga requires an empty document because it modifies its content. An optional encrypted verification-only channel helps with server-side Yandex CAPTCHA without carrying normal VPN traffic.
+
+Linux `amd64` and `arm64` binaries are available in the [latest release](https://github.com/Flofyyk/PaperFlux/releases/latest). `uname -m` reports `x86_64` for amd64 and `aarch64` for arm64.
+
 - [Linux VPS deployment](docs/DEPLOYMENT.md) (Russian)
 - [Android profiles and connection](docs/PAPERFLUX.md) (Russian)
 - [PFS2 protocol](docs/SECURITY_PFS2.md) (Russian)
+- [Transports and Yandex verification](docs/TRANSPORTS.md) (Russian)
 
 ## License and use
 

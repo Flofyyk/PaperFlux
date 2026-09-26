@@ -1,6 +1,10 @@
 Third-Party Licenses
 ====================
 
+PaperFlux is derived from p1neappleXpress/OpenFlux (GPL-3.0-or-later).
+Session, IPC, batching and transport changes retain upstream provenance.
+https://github.com/p1neappleXpress/OpenFlux
+
 This project includes or depends on the following third-party software.
 The original copyright notices and licenses are preserved below.
 
@@ -27,6 +31,13 @@ gorilla/websocket
 https://github.com/gorilla/websocket
 Copyright (c) 2013 The Gorilla WebSocket Authors.
 Licensed under the BSD 2-Clause License.
+
+------------------------------------------------------------------------------
+klauspost/compress (zstd)
+https://github.com/klauspost/compress
+Copyright (c) 2012 The Go Authors. All rights reserved.
+Copyright (c) 2019 Klaus Post. All rights reserved.
+Licensed under the BSD 3-Clause License; full notices are in docs/licenses.
 
 ------------------------------------------------------------------------------
 pion/webrtc

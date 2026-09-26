@@ -26,6 +26,7 @@ sudo install -m 0755 paperflux /usr/local/bin/paperflux
 ```bash
 sudo useradd --system --home /var/lib/paperflux --shell /usr/sbin/nologin paperflux
 sudo install -d -o paperflux -g paperflux -m 0700 /etc/paperflux
+sudo install -d -o paperflux -g paperflux -m 0700 /var/lib/paperflux
 sudo nano /etc/paperflux/paperflux.env
 ```
 
@@ -58,7 +59,8 @@ Wants=network-online.target
 Type=simple
 User=paperflux
 EnvironmentFile=/etc/paperflux/paperflux.env
-ExecStart=/usr/local/bin/paperflux --exit-node --mode proxy --transport yandex --url ${PAPERFLUX_DOCUMENT_URL} --profile-id ${PAPERFLUX_PROFILE_ID} --profile-token ${PAPERFLUX_PROFILE_TOKEN}
+Environment=PAPERFLUX_SESSION_COOKIES=/var/lib/paperflux/session-cookies.json
+ExecStart=/usr/local/bin/paperflux --exit-node --session --mode proxy --transport yandex --urls ${PAPERFLUX_DOCUMENT_URL} --profile-id ${PAPERFLUX_PROFILE_ID} --profile-token ${PAPERFLUX_PROFILE_TOKEN} --auth-service 0.0.0.0:24001
 Restart=on-failure
 RestartSec=5
 
@@ -67,6 +69,10 @@ WantedBy=multi-user.target
 ```
 
 `proxy` — режим по умолчанию в этой инструкции. Он ограничивает одновременные TCP-потоки и открывает обычные исходящие соединения от VPS; root и iptables не нужны.
+
+Пример рассчитан на профиль с ID `1`: служебный порт равен `24000 + ID`, то есть `24001`. Для другого ID измените порт и разрешите его в действующем firewall. Он используется только для шифрованной проверки Яндекса, не для обычного VPN-трафика. Если этот механизм не нужен, уберите `--auth-service`. Для двух документов запишите обе ссылки через запятую в `PAPERFLUX_DOCUMENT_URL`; флаг `--urls` принимает одну или две ссылки.
+
+Флаг `--session` обязателен для Android 0.4.14. PFS2 без этого флага оставлен только для совместимых старых клиентов.
 
 Если требуется пакетный режим, замените `--mode proxy` на `--mode raw`, установите `User=root` и добавьте правило ниже. Оно подавляет TCP RST только для исходящего адреса exit-node, не затрагивая остальные исходящие соединения сервера.
 
@@ -122,5 +128,7 @@ sudo systemctl status paperflux
 - `--profile-id` и `--profile-token` — данные профиля.
 - `--mode proxy|raw` — способ выхода VPS в интернет.
 - `--transport yandex` — транспорт по умолчанию.
+- `--session` — Session с batched/zstd для нового Android-клиента.
+- `--auth-service` — адрес отдельного шифрованного канала проверки Яндекса.
 
 Полный список доступен через `paperflux --help`.

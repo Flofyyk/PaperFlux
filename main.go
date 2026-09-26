@@ -11,7 +11,10 @@ import (
 	"time"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/cupsonline"
+	"universal-bypass-tool/transport/mailru"
 	"universal-bypass-tool/transport/oneme"
+	"universal-bypass-tool/transport/profilesecure"
 	"universal-bypass-tool/transport/relayv2"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
@@ -19,6 +22,7 @@ import (
 )
 
 var (
+	buildVersion = "0.5.6-session"
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
@@ -36,20 +40,28 @@ func main() {
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	tunFdSock := flag.String("tun-fd-sock", "", "abstract Unix socket for an Android VpnService TUN descriptor")
 	packetSock := flag.String("packet-sock", "", "TCP packet bridge address for isolated Android worker")
+	useSession := flag.Bool("session", false, "Use encrypted upstream Session and batched zstd (both peers required)")
+	ipcPath := flag.String("ipc-socket", "", "Private app control socket")
+	authAddress := flag.String("auth-service", "", "Encrypted verification-only listener (exit) or address (client)")
 	clientIPFlag := flag.String("client-ip", "10.10.10.2", "Virtual IPv4 address for this Android worker")
 	exitModeFlag := flag.String("mode", "raw", "Exit-node mode: raw or proxy")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, cupsonline, mailru, oneme, relayv2)")
 	documentURLs := flag.String("urls", "", "Comma-separated Yandex Docs URLs for parallel document lanes")
 	relayURL := flag.String("relay-url", "", "V2 relay WebSocket URL")
 	relayToken := flag.String("relay-token", "", "V2 relay bearer token")
 	relayUser := flag.Uint64("relay-user", 0, "V2 relay user id")
 	relaySession := flag.String("relay-session", "", "V2 relay session id")
-	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
+	flag.StringVar(&globalDocUrl, "url", "", "Document link or Cups room list")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX call user id. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&profileID, "profile-id", "", "PaperFlux profile id")
 	flag.StringVar(&profileToken, "profile-token", "", "PaperFlux profile access token")
+	showVersion := flag.Bool("version", false, "Print PaperFlux build version")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("PaperFlux " + buildVersion)
+		return
+	}
 
 	if !*exitNode && !*client {
 		flag.Usage()
@@ -82,80 +94,119 @@ func main() {
 
 	config := transport.DefaultConfig()
 	var trans transport.Transport
+	var cupsLane *cupsonline.CupsonlineTransport
 
-	switch *transportType {
-	case "yandex":
+	if *useSession {
 		urls := []string{globalDocUrl}
-		if strings.TrimSpace(*documentURLs) != "" {
+		if *transportType == "yandex" && strings.TrimSpace(*documentURLs) != "" {
 			urls = strings.Split(*documentURLs, ",")
 		}
-		lanes := make([]transport.Transport, 0, len(urls))
-		for _, raw := range urls {
-			url := strings.TrimSpace(raw)
-			if url == "" {
-				continue
+		trans, err = newSessionRuntime(*transportType, urls, config, *exitNode, *ipcPath, *authAddress)
+		if err != nil {
+			log.Fatalf("Session setup: %v", err)
+		}
+	} else {
+		switch *transportType {
+		case "yandex":
+			urls := []string{globalDocUrl}
+			if strings.TrimSpace(*documentURLs) != "" {
+				urls = strings.Split(*documentURLs, ",")
 			}
-			// Yandex transport performs batching first and lets WebSocket
-			// permessage-deflate compress the complete JSON/Base64 frame. Do not
-			// wrap individual TUN packets in the legacy LZ4 transport layer.
+			lanes := make([]transport.Transport, 0, len(urls))
+			for _, raw := range urls {
+				url := strings.TrimSpace(raw)
+				if url == "" {
+					continue
+				}
+				// Yandex transport performs batching first and lets WebSocket
+				// permessage-deflate compress the complete JSON/Base64 frame. Do not
+				// wrap individual TUN packets in the legacy LZ4 transport layer.
+				role := "client"
+				if *exitNode {
+					role = "exit"
+				}
+				lanes = append(lanes, yandex.NewYandexDocsTransport(url, config, profileID, profileToken, role))
+			}
+			if len(lanes) == 0 {
+				log.Fatal("No Yandex document URLs configured")
+			}
+			if len(lanes) == 1 {
+				trans = lanes[0]
+			} else {
+				// A multi transport emits one aggregate statistics stream.  Suppress
+				// independent lane streams: their counter resets cannot be interpreted
+				// correctly by a single Android VPN notification.
+				for _, lane := range lanes {
+					if yandexLane, ok := lane.(*yandex.YandexDocsTransport); ok {
+						yandexLane.SetStatsLogging(false)
+					}
+				}
+				trans = transport.NewMultiTransport(lanes, config)
+				// Each document lane is already a WebSocket over TCP, therefore it
+				// provides ordered, acknowledged delivery while that session is alive.
+				// A second ACK/retry layer across two independently rotating documents
+				// caused an ACK feedback queue on Android and reduced throughput. The
+				// Yandex transport owns bounded replay across a session rotation instead.
+				log.Printf("Yandex parallel document lanes: %d", len(lanes))
+			}
+		case "oneme":
+			uidint, _ := strconv.ParseInt(maxUid, 10, 64)
+			trans = transport.NewCompressedTransport(oneme.NewOneMeTransport(*exitNode, maxToken, uidint, config))
+		case "vyandex":
+			if strings.TrimSpace(globalDocUrl) == "" {
+				log.Fatal("Volga requires a dedicated empty public document")
+			}
+			trans, err = profilesecure.New(yandex.NewYandexVolgaTransport(globalDocUrl, config), profileID, profileToken, "vyandex:"+strings.TrimSpace(globalDocUrl), *exitNode)
+			if err != nil {
+				log.Fatalf("Volga profile: %v", err)
+			}
+		case "cupsonline":
+			cupsLane = cupsonline.NewCupsonlineTransport(strings.TrimSpace(globalDocUrl), config, *client)
+			trans, err = profilesecure.New(cupsLane, profileID, profileToken, "cupsonline", *exitNode)
+			if err != nil {
+				log.Fatalf("Cups profile: %v", err)
+			}
+		case "mailru":
+			if strings.TrimSpace(globalDocUrl) == "" {
+				log.Fatal("Mail.ru public document link is required")
+			}
+			trans, err = profilesecure.New(mailru.NewMailruDocsTransport(globalDocUrl, config), profileID, profileToken, "mailru", *exitNode)
+			if err != nil {
+				log.Fatalf("Mail.ru profile: %v", err)
+			}
+		case "relayv2":
 			role := "client"
 			if *exitNode {
 				role = "exit"
 			}
-			lanes = append(lanes, yandex.NewYandexDocsTransport(url, config, profileID, profileToken, role))
-		}
-		if len(lanes) == 0 {
-			log.Fatal("No Yandex document URLs configured")
-		}
-		if len(lanes) == 1 {
-			trans = lanes[0]
-		} else {
-			// A multi transport emits one aggregate statistics stream.  Suppress
-			// independent lane streams: their counter resets cannot be interpreted
-			// correctly by a single Android VPN notification.
-			for _, lane := range lanes {
-				if yandexLane, ok := lane.(*yandex.YandexDocsTransport); ok {
-					yandexLane.SetStatsLogging(false)
-				}
+			var err error
+			trans, err = relayv2.New(relayv2.Config{URL: *relayURL, Token: *relayToken, UserID: *relayUser, Session: *relaySession, Role: role}, config)
+			if err != nil {
+				log.Fatalf("Relay V2 configuration: %v", err)
 			}
-			trans = transport.NewMultiTransport(lanes, config)
-			// Each document lane is already a WebSocket over TCP, therefore it
-			// provides ordered, acknowledged delivery while that session is alive.
-			// A second ACK/retry layer across two independently rotating documents
-			// caused an ACK feedback queue on Android and reduced throughput. The
-			// Yandex transport owns bounded replay across a session rotation instead.
-			log.Printf("Yandex parallel document lanes: %d", len(lanes))
+		default:
+			log.Fatalf("Unknown transport type: %s", *transportType)
 		}
-	case "oneme":
-		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
-		trans = transport.NewCompressedTransport(oneme.NewOneMeTransport(*exitNode, maxToken, uidint, config))
-	case "relayv2":
-		role := "client"
-		if *exitNode {
-			role = "exit"
-		}
-		var err error
-		trans, err = relayv2.New(relayv2.Config{URL: *relayURL, Token: *relayToken, UserID: *relayUser, Session: *relaySession, Role: role}, config)
-		if err != nil {
-			log.Fatalf("Relay V2 configuration: %v", err)
-		}
-	default:
-		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
 
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
+	}
+	if cupsLane != nil && *exitNode && cupsLane.RoomList() != "" {
+		// The manager imports this one tagged value into the private profile DB.
+		// The PFS2 token is never printed and cannot be derived from room IDs.
+		log.Printf("[PAPERFLUX_ROOMS] %s", cupsLane.RoomList())
 	}
 
 	if *client && *tunFdSock != "" {
 		// Do not accept Android's TUN descriptor until the document transport is
 		// authenticated. Otherwise Android immediately sends background traffic
 		// into a queue with no exit path, producing artificial packet drops.
-		log.Printf("Waiting for Yandex transport authentication before TUN attach")
+		log.Printf("Waiting for protected transport before TUN attach")
 		for !trans.IsConnected() {
 			time.Sleep(100 * time.Millisecond)
 		}
-		log.Printf("Yandex transport authenticated; waiting for TUN descriptor")
+		log.Printf("[PAPERFLUX] TRANSPORT_AUTH_OK: protected peer ready; waiting for TUN descriptor")
 		log.Printf("Running as Android VPN CLIENT (waiting for TUN descriptor)")
 		tunFile, err := recvTunFD(*tunFdSock)
 		if err != nil {
@@ -185,7 +236,7 @@ func main() {
 		return
 	}
 	if *client && *packetSock != "" {
-		log.Printf("Yandex transport authenticated; connecting packet bridge %s", *packetSock)
+		log.Printf("Protected transport authenticated; connecting packet bridge %s", *packetSock)
 		bridge, err := connectPacketBridge(*packetSock)
 		if err != nil {
 			log.Fatalf("Failed to connect packet bridge: %v", err)

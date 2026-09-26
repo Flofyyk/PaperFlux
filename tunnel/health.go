@@ -41,11 +41,19 @@ func (t *TCPTunnel) Probe(ctx context.Context) error {
 func (t *TCPTunnel) RunHealthChecks() {
 	healthy := false
 	failures := 0
-	const probeInterval = 45 * time.Second
+	schedule := healthSchedule{}
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
 	for {
+		<-tick.C
+		carrierReady := t.transport.IsConnected()
+		if !schedule.due(time.Now(), carrierReady) {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 		err := t.Probe(ctx)
 		cancel()
+		schedule.completed(time.Now(), err == nil)
 		if err == nil {
 			failures = 0
 			if !healthy {
@@ -66,6 +74,36 @@ func (t *TCPTunnel) RunHealthChecks() {
 				healthy = false
 			}
 		}
-		time.Sleep(probeInterval)
 	}
+}
+
+// A carrier recovery makes the end-to-end probe due immediately, even if a
+// previous successful probe scheduled the next idle check 45 seconds later.
+// The inexpensive ticker sends no traffic while carriers are unavailable.
+type healthSchedule struct {
+	carrier bool
+	next    time.Time
+}
+
+func (s *healthSchedule) due(now time.Time, carrier bool) bool {
+	if !carrier {
+		s.carrier = false
+		return false
+	}
+	if !s.carrier {
+		s.carrier = true
+		s.next = time.Time{}
+	}
+	return !now.Before(s.next)
+}
+
+func (s *healthSchedule) completed(now time.Time, success bool) {
+	s.next = now.Add(healthProbeDelay(success))
+}
+
+func healthProbeDelay(success bool) time.Duration {
+	if success {
+		return 45 * time.Second
+	}
+	return 3 * time.Second
 }

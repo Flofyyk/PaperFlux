@@ -313,6 +313,8 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	})
 }
 
+var dialTimeout = 10 * time.Second
+
 func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
@@ -329,13 +331,18 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 		nic = tcpip.NICID(2)
 	}
 
-	conn, err := gonet.DialTCP(t.gvisorStack, tcpip.FullAddress{
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
 		NIC:  nic,
 		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
 		Port: uint16(tcpAddr.Port),
 	}, ipv4.ProtocolNumber)
 
-	return conn, err
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // DialUDP opens a connected UDP flow inside the gVisor stack.  This mirrors

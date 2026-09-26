@@ -75,25 +75,43 @@ type BaseTransport struct {
 	Mu              sync.RWMutex
 
 	reconnectAttempts atomic.Int32
+	done              chan struct{}
+	doneOnce          sync.Once
 }
 
 func NewBaseTransport(config TransportConfig) *BaseTransport {
 	return &BaseTransport{
 		config:    config,
 		startTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 }
 
 func (b *BaseTransport) Start() error {
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+	b.done = make(chan struct{})
+	b.doneOnce = sync.Once{}
 	b.running.Store(1)
 	b.startTime = time.Now()
 	return nil
 }
 
 func (b *BaseTransport) Stop() error {
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
 	b.running.Store(0)
 	b.connected.Store(0)
+	if b.done != nil {
+		b.doneOnce.Do(func() { close(b.done) })
+	}
 	return nil
+}
+
+func (b *BaseTransport) Done() <-chan struct{} {
+	b.Mu.RLock()
+	defer b.Mu.RUnlock()
+	return b.done
 }
 
 func (b *BaseTransport) IsRunning() bool {

@@ -26,3 +26,17 @@ func Debugf(format string, args ...interface{}) {
 func IsVerbose() bool {
 	return verbose
 }
+
+func Infof(format string, args ...interface{}) { log.Printf(format, args...) }
+
+// SafeGo keeps a transport worker panic from killing the VPN process.
+func SafeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC] recovered in %s: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
