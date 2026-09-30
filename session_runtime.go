@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,15 +33,80 @@ type sessionRuntime struct {
 	ipc      *ipc.Server
 	relay    *authrelay.Relay
 	listener net.Listener
+	auth     *sessionIPC
 	done     chan struct{}
 	once     sync.Once
 	rx, tx   atomic.Uint64
 	cups     *cupsonline.CupsonlineTransport
 	exit     bool
+	quiet    bool
 }
 
-func newSessionRuntime(provider string, urls []string, cfg transport.TransportConfig, exit bool, ipcPath, authAddress string) (*sessionRuntime, error) {
-	if profileID == "" || len(profileToken) < 16 {
+func newSessionRuntime(provider string, urls []string, volgaURL string, cfg transport.TransportConfig, exit bool, ipcPath, authAddress string) (*sessionRuntime, error) {
+	return newProfileSessionRuntime(provider, urls, volgaURL, cfg, exit, ipcPath, authAddress, sessionIdentity{
+		ID: profileID, Token: profileToken, CookiePath: os.Getenv("PAPERFLUX_SESSION_COOKIES"),
+	})
+}
+
+// Identity is explicit: different profiles in one process must never share
+// package-global keys, cookie paths or mutate process-wide environment values.
+type sessionIdentity struct {
+	ID, Token, CookiePath string
+	Quiet                 bool
+}
+
+func profileCookieKey(provider, resource string) string {
+	digest := sha256.Sum256([]byte(provider + "\x00" + resource))
+	return hex.EncodeToString(digest[:])
+}
+
+// A profile owns its Yandex document cookies. A newly added document has no
+// saved jar, while a healthy sibling often has the same account-wide Yandex
+// cookies. Seed only absent jars from another configured document in this
+// profile; never read a different profile store or overwrite its own jar.
+func seedProfileYandexCookies(store *transport.CookieStore, urls []string, volgaURL string) error {
+	if store == nil {
+		return nil
+	}
+	var source map[string]string
+	for _, raw := range urls {
+		resource := strings.TrimSpace(raw)
+		if resource != "" {
+			if jar := store.Load(profileCookieKey("yandex", resource)); len(jar) > 0 {
+				source = jar
+				break
+			}
+		}
+	}
+	if len(source) == 0 && validVolgaDocument(volgaURL) {
+		source = store.Load(profileCookieKey("vyandex", volgaURL))
+	}
+	if len(source) == 0 {
+		return nil
+	}
+	for _, raw := range urls {
+		resource := strings.TrimSpace(raw)
+		if resource == "" {
+			continue
+		}
+		key := profileCookieKey("yandex", resource)
+		if len(store.Load(key)) == 0 {
+			if err := store.Save(key, source); err != nil {
+				return err
+			}
+		}
+	}
+	if validVolgaDocument(volgaURL) {
+		key := profileCookieKey("vyandex", volgaURL)
+		if len(store.Load(key)) == 0 {
+			return store.Save(key, source)
+		}
+	}
+	return nil
+}
+
+func newProfileSessionRuntime(provider string, urls []string, volgaURL string, cfg transport.TransportConfig, exit bool, ipcPath, authAddress string, identity sessionIdentity) (*sessionRuntime, error) {
+	if identity.ID == "" || len(identity.Token) < 16 {
 		return nil, fmt.Errorf("Session requires a profile ID and a secret of at least 16 characters")
 	}
 	sess, err := transport.NewSession(transport.PeerParameters{Capabilities: control.CapabilityIPv4 | control.CapabilityTCP | control.CapabilityUDP, MaxPacketSize: 65000}, exit)
@@ -47,9 +114,14 @@ func newSessionRuntime(provider string, urls []string, cfg transport.TransportCo
 		return nil, err
 	}
 	sess.SetHandshakeTimeout(5 * time.Minute)
-	context := "paperflux-session-v1/profile/" + profileID
-	m := manager.New(sess, nil, profileToken, context)
-	out := &sessionRuntime{Manager: m, session: sess, done: make(chan struct{}), exit: exit}
+	if identity.Quiet {
+		if err := sess.SetBatchByteLimit(256 << 10); err != nil {
+			return nil, err
+		}
+	}
+	context := "paperflux-session-v1/profile/" + identity.ID
+	m := manager.New(sess, nil, identity.Token, context)
+	out := &sessionRuntime{Manager: m, session: sess, done: make(chan struct{}), exit: exit, quiet: identity.Quiet}
 	success := false
 	defer func() {
 		if !success {
@@ -57,14 +129,19 @@ func newSessionRuntime(provider string, urls []string, cfg transport.TransportCo
 		}
 	}()
 	var cookieStore *transport.CookieStore
-	if path := os.Getenv("PAPERFLUX_SESSION_COOKIES"); path != "" {
+	if path := identity.CookiePath; path != "" {
 		cookieStore, err = transport.NewCookieStore(path)
 		if err != nil {
 			return nil, fmt.Errorf("cannot read private session cookie store")
 		}
+		if provider == "yandex" {
+			if err := seedProfileYandexCookies(cookieStore, urls, volgaURL); err != nil {
+				return nil, fmt.Errorf("cannot prepare profile Yandex cookies: %w", err)
+			}
+		}
 	}
 	add := func(name, typ, resource string, raw transport.Transport, priority int, onlyControl bool) error {
-		if err := sess.AddTransport(name, raw, profileToken, context, priority); err != nil {
+		if err := sess.AddTransport(name, raw, identity.Token, context, priority); err != nil {
 			return err
 		}
 		if onlyControl {
@@ -74,9 +151,9 @@ func newSessionRuntime(provider string, urls []string, cfg transport.TransportCo
 		if err := m.Add(name, typ, raw, priority, cookies); err != nil {
 			return err
 		}
+		m.SetURL(name, resource)
 		if cookieStore != nil && cookies != nil {
-			key := sha256.Sum256([]byte(typ + "\x00" + resource))
-			return m.UseCookieStore(cookieStore, name, hex.EncodeToString(key[:]))
+			return m.UseCookieStore(cookieStore, name, profileCookieKey(typ, resource))
 		}
 		return nil
 	}
@@ -104,9 +181,22 @@ func newSessionRuntime(provider string, urls []string, cfg transport.TransportCo
 			return nil, err
 		}
 	}
+	if volgaURL != "" {
+		if provider != "yandex" || !validVolgaDocument(volgaURL) {
+			return nil, fmt.Errorf("Volga fallback needs a separate editable Yandex document")
+		}
+		for _, resource := range urls {
+			if strings.TrimSpace(resource) == volgaURL {
+				return nil, fmt.Errorf("Volga fallback must not share a WebSocket document")
+			}
+		}
+		if err := add("volga-1", "vyandex", volgaURL, yandex.NewYandexVolgaTransport(volgaURL, cfg), 80, false); err != nil {
+			return nil, err
+		}
+	}
 	if authAddress != "" {
 		dc := transport.DefaultDirectConfig()
-		dc.AuthSecret = profileToken
+		dc.AuthSecret = identity.Token
 		dc.ReadTimeout = 45 * time.Second
 		dc.ReconnectMinDelay = 2 * time.Second
 		dc.ReconnectMaxDelay = 30 * time.Second
@@ -121,18 +211,23 @@ func newSessionRuntime(provider string, urls []string, cfg transport.TransportCo
 		}
 	}
 	out.relay = authrelay.New(exit, m.SendControl)
-	// Do not accept remote transport lifecycle or cookie-fetch commands. Only
-	// explicit cookie offers and auth notifications are necessary for this app.
+	// Only pass through authenticated cookie exchange and auth notifications;
+	// remote transport lifecycle commands remain disabled for this app.
 	sess.SetControlHandler(func(sub control.Subtype, p []byte) {
 		switch sub {
 		case authrelay.Subtype:
 			out.relay.Handle(sub, p)
-		case control.SubtypeAuthRequired, control.SubtypeCookiesOffer:
+		case control.SubtypeAuthRequired, control.SubtypeCookiesRequest,
+			control.SubtypeCookiesResponse, control.SubtypeCookiesOffer:
 			m.DispatchControl(sub, p)
+			if (sub == control.SubtypeCookiesResponse || sub == control.SubtypeCookiesOffer) && out.auth != nil {
+				out.auth.onPeerCookies(p)
+			}
 		}
 	})
 	sess.SetRecoveryTiming(3*time.Second, 30*time.Second)
 	bridge := &sessionIPC{manager: m, pending: make(map[string]*ipc.CookiesRequestPayload), snooze: make(map[string]time.Time)}
+	out.auth = bridge
 	if !exit && cookieStore != nil {
 		bridge.restoreSnooze(cookieStore.Path() + ".snooze")
 	}
@@ -164,8 +259,18 @@ func newSessionRuntime(provider string, urls []string, cfg transport.TransportCo
 	success = true
 	return out, nil
 }
+
+var volgaDocumentPath = regexp.MustCompile(`^/i/[A-Za-z0-9_-]+$`)
+
+func validVolgaDocument(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Host == "disk.yandex.ru" &&
+		u.User == nil && u.RawQuery == "" && u.Fragment == "" && volgaDocumentPath.MatchString(u.Path)
+}
 func (s *sessionRuntime) Start() error {
-	go s.stats()
+	if !s.quiet {
+		go s.stats()
+	}
 	if err := s.Manager.Start(); err != nil {
 		return err
 	}
@@ -201,6 +306,17 @@ func (s *sessionRuntime) Send(p []byte) error {
 func (s *sessionRuntime) Receive(cb func([]byte)) {
 	s.Manager.Receive(func(p []byte) { s.rx.Add(uint64(len(p))); cb(p) })
 }
+func (s *sessionRuntime) ReceiveSessionPackets(cb func(uint64, []byte)) {
+	s.session.ReceiveSessionPackets(func(epoch uint64, p []byte) { s.rx.Add(uint64(len(p))); cb(epoch, p) })
+}
+func (s *sessionRuntime) DataEpoch() uint64 { return s.session.DataEpoch() }
+func (s *sessionRuntime) SendSessionPacket(epoch uint64, p []byte) error {
+	err := s.session.SendSessionPacket(epoch, p)
+	if err == nil {
+		s.tx.Add(uint64(len(p)))
+	}
+	return err
+}
 func (s *sessionRuntime) Stats() transport.TransportStats {
 	st := s.Manager.Stats()
 	st.Connected = s.IsConnected()
@@ -212,6 +328,7 @@ func (s *sessionRuntime) stats() {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 	previous := false
+	var lastCookieRequest time.Time
 	for {
 		select {
 		case <-s.done:
@@ -219,6 +336,18 @@ func (s *sessionRuntime) stats() {
 		case <-tick.C:
 		}
 		ready := s.IsConnected()
+		if s.auth != nil {
+			s.auth.clearConnectedLocalPending()
+		}
+		// A service-channel handshake can succeed while every document is
+		// blocked by stale cookies. Ask this profile's authenticated exit for
+		// its current jars, without turning the service channel into a data path.
+		if !ready && s.session.IsConnected() && time.Since(lastCookieRequest) >= 30*time.Second {
+			lastCookieRequest = time.Now()
+			if err := s.Manager.RequestPeerCookies(); err != nil {
+				log.Printf("[PAPERFLUX] profile cookie refresh unavailable: %v", err)
+			}
+		}
 		if ready && !previous {
 			log.Printf("[PAPERFLUX] TRANSPORT_AUTH_OK: encrypted Session data carrier ready")
 		}
@@ -286,14 +415,10 @@ func (h *sessionIPC) persistSnoozeLocked() {
 
 func (h *sessionIPC) OnConnect() {
 	h.mu.Lock()
-	list := make([]*ipc.CookiesRequestPayload, 0, len(h.pending))
 	for _, p := range h.pending {
-		list = append(list, p)
-	}
-	h.mu.Unlock()
-	for _, p := range list {
 		_ = h.server.SendCookiesRequest(p)
 	}
+	h.mu.Unlock()
 }
 func (h *sessionIPC) OnDisconnect() {}
 func (h *sessionIPC) OnCommand(p *ipc.CommandPayload) {
@@ -333,10 +458,10 @@ func (h *sessionIPC) remember(p *ipc.CookiesRequestPayload) {
 		p.RequestID = hex.EncodeToString(nonce[:])
 	}
 	h.pending[key] = p
-	h.mu.Unlock()
 	if h.server != nil {
 		_ = h.server.SendCookiesRequest(p)
 	}
+	h.mu.Unlock()
 }
 func (h *sessionIPC) OnCookies(p *ipc.CookiesOfferPayload) {
 	if p == nil || len(p.Jar) == 0 || len(p.Jar) > 128 {
@@ -366,4 +491,43 @@ func (h *sessionIPC) OnCookies(p *ipc.CookiesOfferPayload) {
 	} else {
 		log.Printf("[PAPERFLUX_AUTH_FAILED] cookie update was not accepted")
 	}
+}
+
+func (h *sessionIPC) onPeerCookies(payload []byte) {
+	cp, err := control.DecodeCookies(payload)
+	if err != nil {
+		return
+	}
+	name := h.manager.MatchingCookieCarrier(cp.Transport, cp.Doc, cp.Jar)
+	if name == "" {
+		return
+	}
+	h.mu.Lock()
+	key := "false/" + name
+	request := h.pending[key]
+	if request != nil {
+		delete(h.pending, key)
+	}
+	h.mu.Unlock()
+	if request != nil {
+		log.Printf("[PAPERFLUX_AUTH_UPDATED] remote=false transport=%s", name)
+		if h.server != nil {
+			_ = h.server.SendLog("AUTH_UPDATED:" + request.RequestID)
+		}
+	}
+}
+
+func (h *sessionIPC) clearConnectedLocalPending() {
+	h.mu.Lock()
+	for key, request := range h.pending {
+		if request.Remote || !h.manager.IsCookieCarrierConnected(request.Transport) {
+			continue
+		}
+		delete(h.pending, key)
+		log.Printf("[PAPERFLUX_AUTH_UPDATED] remote=false transport=%s", request.Transport)
+		if h.server != nil {
+			_ = h.server.SendLog("AUTH_UPDATED:" + request.RequestID)
+		}
+	}
+	h.mu.Unlock()
 }

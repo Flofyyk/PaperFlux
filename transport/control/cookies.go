@@ -10,10 +10,13 @@ import "encoding/json"
 type CookiesPayload struct {
 	// Transport names the transport the cookies belong to. Empty (older
 	// peers) means the highest-priority transport that carries cookies.
-	Transport string            `json:"transport,omitempty"`
-	Jar       map[string]string `json:"jar,omitempty"`
-	Domain    string            `json:"domain,omitempty"`
-	Reason    string            `json:"reason,omitempty"`
+	Transport string `json:"transport,omitempty"`
+	// Doc identifies the same carrier when peers use different local names.
+	// Optional for compatibility with older peers.
+	Doc    string            `json:"doc,omitempty"`
+	Jar    map[string]string `json:"jar,omitempty"`
+	Domain string            `json:"domain,omitempty"`
+	Reason string            `json:"reason,omitempty"`
 }
 
 // Encode serializes the payload to JSON.
@@ -38,6 +41,7 @@ type AuthRequiredPayload struct {
 	Transport string `json:"transport"`
 	URL       string `json:"url"`
 	Reason    string `json:"reason"`
+	Doc       string `json:"doc,omitempty"`
 }
 
 // Encode serializes the payload to JSON.

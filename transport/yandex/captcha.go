@@ -50,11 +50,17 @@ func solveCaptcha(ctx context.Context, docURL string, jar http.CookieJar, userAg
 		if err != nil {
 			return "", fmt.Errorf("captcha GET: %w", safeAuthError(err))
 		}
-		io.Copy(io.Discard, io.LimitReader(resp.Body, maxAuthHTML))
+		page, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAuthHTML+1))
 		resp.Body.Close()
+		if readErr != nil || len(page) > maxAuthHTML {
+			return "", fmt.Errorf("captcha: invalid or oversized page")
+		}
 
 		if resp.StatusCode == 200 {
-
+			if captchaResponseIsChallenge(req.URL, page) {
+				captchaURL = currentURL
+				break
+			}
 			return "", nil
 		}
 
@@ -70,7 +76,7 @@ func solveCaptcha(ctx context.Context, docURL string, jar http.CookieJar, userAg
 			return "", fmt.Errorf("captcha: redirect without Location")
 		}
 
-		if strings.Contains(loc, "showcaptchafast") {
+		if strings.Contains(loc, "showcaptcha") {
 			captchaURL = loc
 			break
 		}
@@ -144,10 +150,54 @@ func solveCaptcha(ctx context.Context, docURL string, jar http.CookieJar, userAg
 
 	retpath := resp2.Header.Get("Location")
 	if retpath == "" {
-		retpath = docURL
+		return "", fmt.Errorf("captcha: verification was not confirmed")
 	}
+	target, err := url.Parse(retpath)
+	if err != nil {
+		return "", fmt.Errorf("captcha: invalid verification redirect")
+	}
+	return followCaptchaResult(ctx, client, req2.URL.ResolveReference(target).String(), userAgent)
+}
 
-	return retpath, nil
+func captchaResponseIsChallenge(requestURL *url.URL, body []byte) bool {
+	return strings.Contains(requestURL.Path, "showcaptcha") ||
+		bytes.Contains(body, []byte(`id="tmgrdfrend-form"`)) ||
+		bytes.Contains(body, []byte(`id="checkbox-captcha-form"`))
+}
+
+func followCaptchaResult(ctx context.Context, client *http.Client, rawURL, userAgent string) (string, error) {
+	for redirects := 0; redirects < 10; redirects++ {
+		req, err := captchaRequest(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return "", err
+		}
+		setBrowserHeaders(req, userAgent)
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("captcha verification GET: %w", safeAuthError(err))
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAuthHTML+1))
+		resp.Body.Close()
+		if readErr != nil || len(body) > maxAuthHTML {
+			return "", fmt.Errorf("captcha: invalid or oversized verification page")
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location, err := resp.Location()
+			if err != nil {
+				return "", fmt.Errorf("captcha: invalid verification redirect")
+			}
+			if strings.Contains(location.Path, "showcaptcha") {
+				return "", fmt.Errorf("captcha: interactive verification required")
+			}
+			rawURL = location.String()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK || captchaResponseIsChallenge(req.URL, body) {
+			return "", fmt.Errorf("captcha: verification rejected")
+		}
+		return rawURL, nil
+	}
+	return "", fmt.Errorf("captcha: too many verification redirects")
 }
 
 // ---- парсинг showcaptchafast ----

@@ -74,3 +74,29 @@ func TestCaptchaWorkBounds(t *testing.T) {
 		t.Fatal("work budget ignored")
 	}
 }
+
+func TestCaptchaVerificationRequiresDocumentPage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response func(*http.Request) *http.Response
+		wantOK   bool
+	}{
+		{"redirect back to challenge", func(r *http.Request) *http.Response {
+			return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"/showcaptchafast"}}, Body: io.NopCloser(strings.NewReader("")), Request: r}
+		}, false},
+		{"challenge returned as 200", func(r *http.Request) *http.Response {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`<form id="tmgrdfrend-form">`)), Request: r}
+		}, false},
+		{"ordinary document", func(r *http.Request) *http.Response {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`<script id="client-config">{}</script>`)), Request: r}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: authRoundTripper(func(r *http.Request) (*http.Response, error) { return tc.response(r), nil })}
+			_, err := followCaptchaResult(context.Background(), client, "https://disk.yandex.ru/i/test", authUserAgent)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("unexpected verification result: %v", err)
+			}
+		})
+	}
+}

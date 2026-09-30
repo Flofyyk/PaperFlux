@@ -1,7 +1,9 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
+	"golang.org/x/time/rate"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -29,6 +31,16 @@ type RawSocketEndpoint struct {
 	sendToTransport func([]byte)
 	clientIP        [4]byte
 	clientIPSet     atomic.Bool
+	flowMu          sync.Mutex
+	flowIndex       map[clientFlowKey]flowKey
+	maxFlows        int
+	flowRejected    atomic.Uint64
+	closed          bool
+	done            chan struct{}
+	closeOnce       sync.Once
+	uploadLimiter   *rate.Limiter
+	limitContext    context.Context
+	limitCancel     context.CancelFunc
 }
 
 type flowKey struct {
@@ -39,9 +51,12 @@ type flowKey struct {
 }
 
 type flowState struct {
-	synSeq   uint32 // TCP only
-	seenAt   time.Time
-	clientIP [4]byte
+	synSeq      uint32 // TCP only
+	seenAt      time.Time
+	clientIP    [4]byte
+	original    clientFlowKey
+	reservation int
+	closingAt   time.Time
 }
 
 func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
@@ -73,6 +88,7 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		return nil, fmt.Errorf("recv socket failed: %v (need root)", err)
 	}
 	_ = syscall.SetsockoptInt(tcpRecvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
+	_ = syscall.SetsockoptTimeval(tcpRecvFd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 1})
 
 	addr := &syscall.SockaddrInet4{
 		Addr: [4]byte{0, 0, 0, 0},
@@ -90,6 +106,7 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		return nil, fmt.Errorf("UDP recv socket failed: %v", err)
 	}
 	_ = syscall.SetsockoptInt(udpRecvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
+	_ = syscall.SetsockoptTimeval(udpRecvFd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &syscall.Timeval{Sec: 1})
 	if err := syscall.Bind(udpRecvFd, addr); err != nil {
 		syscall.Close(sendFd)
 		syscall.Close(tcpRecvFd)
@@ -103,7 +120,11 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		udpRecvFd: udpRecvFd,
 		nicID:     nicID,
 		egressIP:  egressIP,
+		maxFlows:  configuredFlowLimit(),
+		done:      make(chan struct{}),
 	}
+	ep.uploadLimiter = newExitLimiter()
+	ep.limitContext, ep.limitCancel = context.WithCancel(context.Background())
 
 	go ep.readLoop(tcpRecvFd, 6)
 	go ep.readLoop(udpRecvFd, 17)
@@ -127,6 +148,11 @@ func (e *RawSocketEndpoint) readLoop(fd int, expectedProtocol byte) {
 	buf := make([]byte, 65535)
 
 	for {
+		select {
+		case <-e.done:
+			return
+		default:
+		}
 		n, _, err := syscall.Recvfrom(fd, buf, 0)
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
@@ -148,6 +174,11 @@ func (e *RawSocketEndpoint) readLoop(fd int, expectedProtocol byte) {
 		if ihl < 20 || n < ihl+8 {
 			continue
 		}
+		total := int(buf[2])<<8 | int(buf[3])
+		if total < ihl+8 || total > n || buf[6]&0x3f != 0 || buf[7] != 0 {
+			continue
+		}
+		n = total
 		if protocol == 6 && n < ihl+20 {
 			continue
 		}
@@ -161,7 +192,11 @@ func (e *RawSocketEndpoint) readLoop(fd int, expectedProtocol byte) {
 			var remote [4]byte
 			copy(remote[:], buf[12:16])
 			key := flowKey{protocol: protocol, remoteIP: remote, remotePort: srcPort, localPort: dstPort}
-			flow, active := e.activeFlows.Load(key)
+			ackNum := uint32(0)
+			if protocol == 6 {
+				ackNum = uint32(buf[ihl+8])<<24 | uint32(buf[ihl+9])<<16 | uint32(buf[ihl+10])<<8 | uint32(buf[ihl+11])
+			}
+			state, active := e.replyFlow(key, protocol == 6 && flags&0x12 == 0x12, ackNum)
 			// Do not log flow addresses on the packet path. Apart from exposing
 			// destinations in persistent server logs, formatting these lines under
 			// load consumed enough CPU and I/O to affect tunnel throughput.
@@ -172,28 +207,15 @@ func (e *RawSocketEndpoint) readLoop(fd int, expectedProtocol byte) {
 				continue
 			}
 
-			if protocol == 6 && flags == 0x12 {
-				ackNum := uint32(buf[ihl+8])<<24 | uint32(buf[ihl+9])<<16 | uint32(buf[ihl+10])<<8 | uint32(buf[ihl+11])
-				synSeq := ackNum - 1
-				if !active || flow.(flowState).synSeq != synSeq {
-					continue
-				}
-			}
-			if active {
-				state := flow.(flowState)
-				state.seenAt = time.Now()
-				e.activeFlows.Store(key, state)
-			}
-
 			pktCopy := make([]byte, n)
 			copy(pktCopy, buf[:n])
 
-			state := flow.(flowState)
 			copy(pktCopy[16:20], state.clientIP[:])
+			pktCopy[ihl+2], pktCopy[ihl+3] = byte(state.original.localPort>>8), byte(state.original.localPort)
 
 			pktCopy[10] = 0
 			pktCopy[11] = 0
-			ipChecksumVal := network.IPChecksum(pktCopy[:20])
+			ipChecksumVal := network.IPChecksum(pktCopy[:ihl])
 			pktCopy[10] = byte(ipChecksumVal >> 8)
 			pktCopy[11] = byte(ipChecksumVal & 0xFF)
 
@@ -263,12 +285,35 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 		if protocol == 6 && len(pktCopy) < ipHeaderLen+20 {
 			continue
 		}
+		total := int(pktCopy[2])<<8 | int(pktCopy[3])
+		if total < ipHeaderLen+8 || total > len(pktCopy) || pktCopy[6]&0x3f != 0 || pktCopy[7] != 0 {
+			continue
+		}
+		pktCopy = pktCopy[:total]
+		if protocol == 6 && total < ipHeaderLen+20 {
+			continue
+		}
+		transportHeader := pktCopy[ipHeaderLen:]
+		var remote [4]byte
+		copy(remote[:], pktCopy[16:20])
+		original := clientFlowKey{flowKey: flowKey{protocol: protocol, remoteIP: remote,
+			remotePort: uint16(transportHeader[2])<<8 | uint16(transportHeader[3]),
+			localPort:  uint16(transportHeader[0])<<8 | uint16(transportHeader[1])}, clientIP: clientIP}
+		flags, seq := byte(0), uint32(0)
+		if protocol == 6 {
+			flags = transportHeader[13]
+			seq = uint32(transportHeader[4])<<24 | uint32(transportHeader[5])<<16 | uint32(transportHeader[6])<<8 | uint32(transportHeader[7])
+		}
+		key, _, allowed := e.claimFlow(original, seq, protocol == 17 || flags&0x02 != 0, protocol == 6 && flags&0x05 != 0)
+		if !allowed {
+			continue
+		}
+		transportHeader[0], transportHeader[1] = byte(key.localPort>>8), byte(key.localPort)
 		pktCopy[10], pktCopy[11] = 0, 0
-		ipChecksumVal := network.IPChecksum(pktCopy[:20])
+		ipChecksumVal := network.IPChecksum(pktCopy[:ipHeaderLen])
 		pktCopy[10] = byte(ipChecksumVal >> 8)
 		pktCopy[11] = byte(ipChecksumVal & 0xFF)
 
-		transportHeader := pktCopy[ipHeaderLen:]
 		srcIPBytes := [4]byte{pktCopy[12], pktCopy[13], pktCopy[14], pktCopy[15]}
 		dstIPBytes := [4]byte{pktCopy[16], pktCopy[17], pktCopy[18], pktCopy[19]}
 		if protocol == 6 {
@@ -284,27 +329,8 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 			transportHeader[6], transportHeader[7] = byte(checksum>>8), byte(checksum)
 		}
 
-		srcPort := uint16(transportHeader[0])<<8 | uint16(transportHeader[1])
-		var remote [4]byte
-		copy(remote[:], pktCopy[16:20])
-		flowKey := flowKey{protocol: protocol, remoteIP: remote, remotePort: uint16(transportHeader[2])<<8 | uint16(transportHeader[3]), localPort: srcPort}
-		flags := byte(0)
-		if protocol == 6 {
-			flags = transportHeader[13]
-		}
 		// Packet-path tracing is intentionally disabled in the normal build;
 		// diagnostics are available through the bounded aggregate counters.
-
-		if protocol == 6 && flags&0x02 != 0 {
-			seqNum := uint32(transportHeader[4])<<24 | uint32(transportHeader[5])<<16 | uint32(transportHeader[6])<<8 | uint32(transportHeader[7])
-			e.activeFlows.Store(flowKey, flowState{synSeq: seqNum, seenAt: time.Now(), clientIP: clientIP})
-		} else if protocol == 17 {
-			e.activeFlows.Store(flowKey, flowState{seenAt: time.Now(), clientIP: clientIP})
-		}
-
-		if protocol == 6 && (flags&0x01 != 0 || flags&0x04 != 0) {
-			e.activeFlows.Delete(flowKey)
-		}
 
 		var dst [4]byte
 		copy(dst[:], pktCopy[16:20])
@@ -314,6 +340,11 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 			Port: 0,
 		}
 
+		if e.uploadLimiter != nil {
+			if err := e.uploadLimiter.WaitN(e.limitContext, len(pktCopy)); err != nil {
+				continue
+			}
+		}
 		if err := syscall.Sendto(e.sendFd, pktCopy, 0, addr); err != nil {
 			utils.Debugf("[RAW-NIC%d] Sendto failed: %v", e.nicID, err)
 			continue
@@ -330,20 +361,17 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 func (e *RawSocketEndpoint) expireFlows() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		e.activeFlows.Range(func(key, value any) bool {
-			flowKey := key.(flowKey)
-			state := value.(flowState)
-			ttl := 90 * time.Second
-			if flowKey.protocol == 6 {
-				ttl = 5 * time.Minute
-			}
-			if now.Sub(state.seenAt) > ttl {
-				e.activeFlows.Delete(key)
-			}
-			return true
-		})
+	for {
+		select {
+		case <-e.done:
+			return
+		case now := <-ticker.C:
+			e.pruneFlows(now, false)
+			e.flowMu.Lock()
+			active := len(e.flowIndex)
+			e.flowMu.Unlock()
+			utils.Debugf("[EXIT_LIMITS] active=%d rejected=%d", active, e.flowRejected.Load())
+		}
 	}
 }
 
@@ -361,9 +389,18 @@ func (e *RawSocketEndpoint) Wait()                                   {}
 func (e *RawSocketEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
 func (e *RawSocketEndpoint) AddHeader(*stack.PacketBuffer)           {}
 func (e *RawSocketEndpoint) Close() {
-	syscall.Close(e.sendFd)
-	syscall.Close(e.tcpRecvFd)
-	syscall.Close(e.udpRecvFd)
+	e.closeOnce.Do(func() {
+		if e.limitCancel != nil {
+			e.limitCancel()
+		}
+		if e.done != nil {
+			close(e.done)
+		}
+		e.pruneFlows(time.Now(), true)
+		syscall.Close(e.sendFd)
+		syscall.Close(e.tcpRecvFd)
+		syscall.Close(e.udpRecvFd)
+	})
 }
 func (e *RawSocketEndpoint) SetMTU(uint32)                        {}
 func (e *RawSocketEndpoint) SetLinkAddress(tcpip.LinkAddress)     {}

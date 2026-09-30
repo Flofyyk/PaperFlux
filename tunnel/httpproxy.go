@@ -24,7 +24,42 @@ func NewSideTunnel(trans transport.Transport, lo, hi uint16) (*TCPTunnel, error)
 }
 
 // CloseSideTunnel is used only for a dedicated authentication side stack.
-func (t *TCPTunnel) Close() { t.gvisorStack.Close() }
+func (t *TCPTunnel) Close() {
+	t.closeOnce.Do(func() {
+		t.cancel()
+		t.connectionsMu.Lock()
+		connections := make([]net.Conn, 0, len(t.connections))
+		for conn := range t.connections {
+			connections = append(connections, conn)
+		}
+		t.connectionsMu.Unlock()
+		for _, conn := range connections {
+			conn.Close()
+		}
+		if t.rawEP != nil {
+			t.rawEP.Close()
+		}
+		t.gvisorStack.Close()
+	})
+}
+
+func (t *TCPTunnel) trackConnection(conn net.Conn) bool {
+	t.connectionsMu.Lock()
+	defer t.connectionsMu.Unlock()
+	if t.lifecycleContext.Err() != nil {
+		conn.Close()
+		return false
+	}
+	t.connections[conn] = struct{}{}
+	return true
+}
+func (t *TCPTunnel) releaseConnection(conn net.Conn) {
+	conn.Close()
+	t.connectionsMu.Lock()
+	delete(t.connections, conn)
+	t.connectionsMu.Unlock()
+}
+func (t *TCPTunnel) ActiveFlows() int { return len(t.proxyFlows) }
 
 // ServeHTTPProxy serves a plain HTTP proxy (CONNECT and absolute-URI
 // requests) on ln, opening every upstream connection with dial. It is what

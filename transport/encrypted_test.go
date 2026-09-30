@@ -81,6 +81,9 @@ func TestEncryptedTransportRejectsWrongKeyTamperingAndReplay(t *testing.T) {
 	if called != 0 {
 		t.Fatal("wrong key was accepted")
 	}
+	if d := wrongExit.Diagnostics(); d.RawFrames != 1 || d.BadKey != 1 || d.Decrypted != 0 {
+		t.Fatalf("wrong-key diagnostics = %+v", d)
+	}
 
 	rightWire := &testTransport{}
 	rightExit, err := NewEncryptedTransport(rightWire, "first sufficiently long secret", "document", true)
@@ -98,6 +101,9 @@ func TestEncryptedTransportRejectsWrongKeyTamperingAndReplay(t *testing.T) {
 	rightWire.deliver(wire.sent)
 	if called != 1 {
 		t.Fatalf("replayed packet delivered %d times, want 1", called)
+	}
+	if d := rightExit.Diagnostics(); d.RawFrames != 3 || d.BadKey != 1 || d.Decrypted != 1 {
+		t.Fatalf("tamper/replay diagnostics = %+v", d)
 	}
 }
 

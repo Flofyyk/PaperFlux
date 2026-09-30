@@ -36,11 +36,11 @@ func (s *Session) AddTransportPostStart(name string, raw Transport, secret, cont
 	}
 	s.mu.Unlock()
 
-	enc, err := NewEncryptedTransport(raw, secret, context, s.exit)
+	enc, err := s.wrapEncrypted(raw, secret, context)
 	if err != nil {
 		return fmt.Errorf("session: wrap %q: %w", name, err)
 	}
-	bat := NewBatchedTransport(enc)
+	bat := s.newBatched(enc)
 
 	// bat.Start starts raw through the encryption layer.
 	if err := bat.Start(); err != nil {

@@ -602,9 +602,11 @@ func TestClientRetriesRoomItCouldNotEnterAtStart(t *testing.T) {
 		}
 	}
 	expectSet(t, client, want)
-	if exit.wss[1].stats.packetsSent.Load() == before {
-		t.Fatal("the late room carried no traffic")
-	}
+	// Receipt may precede the sender's post-write accounting on a fast local
+	// socket. Wait for that accounting rather than racing its atomic counter.
+	waitFor(t, time.Second, "late room send accounting", func() bool {
+		return exit.wss[1].stats.packetsSent.Load() > before
+	})
 }
 
 func TestExitKeepsSavedRoomsThroughNetworkTrouble(t *testing.T) {

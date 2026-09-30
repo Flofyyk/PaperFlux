@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,10 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// A public link can resolve to a preview rather than an editable document.
+// Retrying such a page every few seconds only increases provider throttling.
+var errVolgaEditorUnavailable = errors.New("Volga editor is unavailable for this document")
 
 type VolgaConfig struct {
 	MaxIdleConnsPerHost int
@@ -176,7 +181,7 @@ func authorizeWithJar(ctx context.Context, docURL string, jar http.CookieJar) (*
 	editor, _ := cfg["editorParams"].(map[string]interface{})
 
 	if office == nil {
-		return nil, fmt.Errorf("officeActionData missing (keys: %v)", mapKeys(cfg))
+		return nil, fmt.Errorf("%w: officeActionData missing (keys: %v)", errVolgaEditorUnavailable, mapKeys(cfg))
 	}
 
 	actionURL := getStr(office, "action_url")
@@ -191,10 +196,10 @@ func authorizeWithJar(ctx context.Context, docURL string, jar http.CookieJar) (*
 	}
 
 	if actionURL == "" {
-		return nil, fmt.Errorf("action_url missing (keys: %v)", mapKeys(office))
+		return nil, fmt.Errorf("%w: action_url missing (keys: %v)", errVolgaEditorUnavailable, mapKeys(office))
 	}
 	if a.AccessToken == "" {
-		return nil, fmt.Errorf("access_token missing")
+		return nil, fmt.Errorf("%w: access_token missing", errVolgaEditorUnavailable)
 	}
 
 	ttlStr := formatTTL(ttl)

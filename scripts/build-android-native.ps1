@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$NdkPath,
     [string]$AndroidProject,
-    [string]$Version = '0.5.7-session',
+    [string]$Version = '0.5.8',
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../output/android')
 )
 $ErrorActionPreference = 'Stop'

@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"golang.org/x/time/rate"
 	"io"
 	"net"
 	"strconv"
@@ -53,19 +54,26 @@ func ParseExitMode(value string) (ExitMode, error) {
 }
 
 type TCPTunnel struct {
-	gvisorStack  *stack.Stack
-	tunnelEP     *TunnelLinkEndpoint
-	transport    transport.Transport
-	isExitNode   bool
-	exitMode     ExitMode
-	clientIP     [4]byte
-	rawEP        *RawSocketEndpoint
-	startTime    time.Time
-	packetCount  atomic.Uint64
-	outboundQ    chan []byte
-	outboundDrop atomic.Uint64
-	outboundErr  atomic.Uint64
-	proxyFlows   chan struct{}
+	gvisorStack        *stack.Stack
+	tunnelEP           *TunnelLinkEndpoint
+	transport          transport.Transport
+	isExitNode         bool
+	exitMode           ExitMode
+	clientIP           [4]byte
+	rawEP              *RawSocketEndpoint
+	startTime          time.Time
+	packetCount        atomic.Uint64
+	outboundQ          chan []byte
+	outboundDrop       atomic.Uint64
+	outboundErr        atomic.Uint64
+	proxyFlows         chan struct{}
+	downloadLimiter    *rate.Limiter
+	proxyUploadLimiter *rate.Limiter
+	lifecycleContext   context.Context
+	cancel             context.CancelFunc
+	closeOnce          sync.Once
+	connectionsMu      sync.Mutex
+	connections        map[net.Conn]struct{}
 }
 
 func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
@@ -80,11 +88,19 @@ func NewTCPTunnelWithClientIP(trans transport.Transport, isExitNode bool, client
 
 func NewTCPTunnelWithClientIPMode(trans transport.Transport, isExitNode bool, clientIP [4]byte, exitMode ExitMode) *TCPTunnel {
 	t := &TCPTunnel{
-		transport:  trans,
-		isExitNode: isExitNode,
-		clientIP:   clientIP,
-		exitMode:   exitMode,
-		startTime:  time.Now(),
+		transport:   trans,
+		isExitNode:  isExitNode,
+		clientIP:    clientIP,
+		exitMode:    exitMode,
+		startTime:   time.Now(),
+		connections: make(map[net.Conn]struct{}),
+	}
+	t.lifecycleContext, t.cancel = context.WithCancel(context.Background())
+	if isExitNode {
+		t.downloadLimiter = newExitLimiter()
+		if exitMode == ExitModeProxy {
+			t.proxyUploadLimiter = newExitLimiter()
+		}
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
@@ -107,10 +123,18 @@ func NewTCPTunnelWithClientIPMode(trans transport.Transport, isExitNode bool, cl
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
+		if isExitNode && exitMode == ExitModeProxy && t.downloadLimiter != nil {
+			if err := t.downloadLimiter.WaitN(t.lifecycleContext, len(data)); err != nil {
+				return
+			}
+		}
 		// A full transport queue is temporary congestion, not a reason to
 		// discard a TCP segment. Keep backpressure on gVisor for a short bounded
 		// window; the old four millisecond window caused avoidable retransmits.
 		for attempt := 0; attempt < 24; attempt++ {
+			if t.lifecycleContext.Err() != nil {
+				return
+			}
 			if err := trans.Send(data); err == nil {
 				return
 			}
@@ -140,6 +164,14 @@ func NewTCPTunnelWithClientIPMode(trans transport.Transport, isExitNode bool, cl
 	}
 
 	trans.Receive(func(data []byte) {
+		if t.lifecycleContext.Err() != nil {
+			return
+		}
+		if t.proxyUploadLimiter != nil {
+			if err := t.proxyUploadLimiter.WaitN(t.lifecycleContext, len(data)); err != nil {
+				return
+			}
+		}
 		tunnelEP.InjectInbound(data)
 	})
 
@@ -212,9 +244,8 @@ func (t *TCPTunnel) setupExitNodeRaw(tunnelNIC tcpip.NICID) {
 	})
 }
 
-const maxProxyFlows = 1024
-
 func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
+	maxProxyFlows := configuredFlowLimit()
 	utils.Debugf("[TUNNEL] EXIT NODE - proxy mode")
 	t.gvisorStack.SetPromiscuousMode(tunnelNIC, true)
 	t.gvisorStack.SetSpoofing(tunnelNIC, true)
@@ -222,10 +253,19 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 	t.proxyFlows = make(chan struct{}, maxProxyFlows)
 	fwd := tcp.NewForwarder(t.gvisorStack, 0, maxProxyFlows, t.handleProxyTCP)
 	t.gvisorStack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	// This callback creates the endpoint synchronously. Do not clone pkt:
+	// this gVisor revision's UDP Forwarder clones it without releasing it.
+	t.gvisorStack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		return t.handleProxyUDP(udp.NewForwarderRequest(t.gvisorStack, id, pkt))
+	})
 }
 
 func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 	id := request.ID()
+	if !t.allowedProxyPeer(id) {
+		request.Complete(true)
+		return
+	}
 	// JoinHostPort preserves IPv6 bracket syntax. Formatting the pair manually
 	// works for IPv4 but produces an ambiguous address for IPv6 destinations.
 	destination := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
@@ -247,6 +287,10 @@ func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 	}
 	request.Complete(false)
 	local := gonet.NewTCPConn(&waitQueue, endpoint)
+	if !t.trackConnection(local) {
+		<-t.proxyFlows
+		return
+	}
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -254,14 +298,17 @@ func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 			}
 		}()
 		defer func() { <-t.proxyFlows }()
-		defer local.Close()
+		defer t.releaseConnection(local)
 		dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-		remote, err := dialer.Dial("tcp", destination)
+		remote, err := dialer.DialContext(t.lifecycleContext, "tcp", destination)
 		if err != nil {
 			utils.Debugf("[EXIT] proxy dial %s failed: %v", destination, err)
 			return
 		}
-		defer remote.Close()
+		if !t.trackConnection(remote) {
+			return
+		}
+		defer t.releaseConnection(remote)
 		if tcpConn, ok := remote.(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
 		}
@@ -287,7 +334,19 @@ func copyBothWays(left, right net.Conn) {
 }
 
 func (t *TCPTunnel) drainOutbound() {
-	for packet := range t.outboundQ {
+	for {
+		var packet []byte
+		select {
+		case <-t.lifecycleContext.Done():
+			return
+		case packet = <-t.outboundQ:
+		}
+		if t.downloadLimiter != nil {
+			if err := t.downloadLimiter.WaitN(t.lifecycleContext, len(packet)); err != nil {
+				t.outboundDrop.Add(1)
+				continue
+			}
+		}
 		if err := t.transport.Send(packet); err != nil {
 			n := t.outboundErr.Add(1)
 			if n <= 5 || n%1000 == 0 {
@@ -387,7 +446,12 @@ func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-t.lifecycleContext.Done():
+			return
+		case <-ticker.C:
+		}
 		stats := t.gvisorStack.Stats()
 		queueDepth := 0
 		if t.outboundQ != nil {

@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	buildVersion = "0.5.7-session"
+	buildVersion = "0.5.8"
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
@@ -41,12 +41,16 @@ func main() {
 	tunFdSock := flag.String("tun-fd-sock", "", "abstract Unix socket for an Android VpnService TUN descriptor")
 	packetSock := flag.String("packet-sock", "", "TCP packet bridge address for isolated Android worker")
 	useSession := flag.Bool("session", false, "Use encrypted upstream Session and batched zstd (both peers required)")
+	exitProfiles := flag.String("exit-profiles", "", "Experimental private multi-profile manifest (proxy exit only)")
+	exitStats := flag.String("exit-stats", "", "Private atomic JSON metrics for experimental profile group")
+	exitCookies := flag.String("exit-cookies", "", "Private per-profile cookie directory for experimental group")
 	ipcPath := flag.String("ipc-socket", "", "Private app control socket")
 	authAddress := flag.String("auth-service", "", "Encrypted verification-only listener (exit) or address (client)")
 	clientIPFlag := flag.String("client-ip", "10.10.10.2", "Virtual IPv4 address for this Android worker")
 	exitModeFlag := flag.String("mode", "raw", "Exit-node mode: raw or proxy")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, cupsonline, mailru, oneme, relayv2)")
 	documentURLs := flag.String("urls", "", "Comma-separated Yandex Docs URLs for parallel document lanes")
+	volgaURL := flag.String("volga-url", "", "Dedicated empty editable Yandex document for the optional Volga fallback lane")
 	relayURL := flag.String("relay-url", "", "V2 relay WebSocket URL")
 	relayToken := flag.String("relay-token", "", "V2 relay bearer token")
 	relayUser := flag.Uint64("relay-user", 0, "V2 relay user id")
@@ -60,6 +64,15 @@ func main() {
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("PaperFlux " + buildVersion)
+		return
+	}
+	if *exitProfiles != "" {
+		if !*exitNode || *client || *exitModeFlag != "proxy" || !*useSession {
+			log.Fatal("profile groups require --exit-node --session --mode proxy")
+		}
+		if err := runExitGroup(*exitProfiles, *exitStats, *exitCookies); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 
@@ -101,7 +114,7 @@ func main() {
 		if *transportType == "yandex" && strings.TrimSpace(*documentURLs) != "" {
 			urls = strings.Split(*documentURLs, ",")
 		}
-		trans, err = newSessionRuntime(*transportType, urls, config, *exitNode, *ipcPath, *authAddress)
+		trans, err = newSessionRuntime(*transportType, urls, *volgaURL, config, *exitNode, *ipcPath, *authAddress)
 		if err != nil {
 			log.Fatalf("Session setup: %v", err)
 		}

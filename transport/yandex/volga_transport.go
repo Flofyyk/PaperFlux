@@ -158,6 +158,17 @@ func (t *YandexVolgaTransport) supervise() {
 		}
 		if err != nil {
 			log.Printf("[PAPERFLUX] Volga authorization failed: %v", safeAuthError(err))
+			if errors.Is(err, errVolgaEditorUnavailable) {
+				// A cookie update cannot turn a preview page into an editor. Avoid
+				// hammering Yandex while the other document channels remain usable.
+				t.RecordReconnect()
+				select {
+				case <-t.ctx.Done():
+					return
+				case <-time.After(5 * time.Minute):
+				}
+				continue
+			}
 			if errors.Is(err, errCaptchaChallenge) || errors.Is(err, errLoginRequired) {
 				delay = 30 * time.Second
 				t.mu.Lock()

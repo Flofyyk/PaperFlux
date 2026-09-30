@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +26,10 @@ import (
 // Each transport is wrapped in its own EncryptedTransport + BatchedTransport
 // inside a transportLink. The Session coordinates them.
 type Session struct {
-	mu sync.Mutex
+	mu              sync.Mutex
+	encryptionMu    sync.Mutex
+	encryptionCache map[[32]byte]encryptionKeys
+	batchByteLimit  int64
 
 	// Handshake state, shared across all transports.
 	local            [32]byte
@@ -37,6 +41,7 @@ type Session struct {
 	started          bool
 	stopped          bool
 	sequence         uint64
+	dataEpoch        uint64
 	highest          uint64
 	window           uint64
 	handshakeTimeout time.Duration
@@ -70,6 +75,7 @@ type Session struct {
 
 	// Callbacks.
 	dataCallback    func([]byte)
+	epochCallback   func(uint64, []byte)
 	controlCallback ControlHandler
 
 	done chan struct{}
@@ -176,11 +182,11 @@ func (s *Session) AddTransport(name string, raw Transport, secret, context strin
 	}
 	s.mu.Unlock()
 
-	enc, err := NewEncryptedTransport(raw, secret, context, s.exit)
+	enc, err := s.wrapEncrypted(raw, secret, context)
 	if err != nil {
 		return fmt.Errorf("session: wrap %q: %w", name, err)
 	}
-	bat := NewBatchedTransport(enc)
+	bat := s.newBatched(enc)
 
 	link := &transportLink{
 		name:      name,
@@ -264,7 +270,7 @@ func (s *Session) Start() error {
 
 	for _, link := range links {
 		if err := s.startLink(link); err != nil {
-			utils.Debugf("[SESSION] transport %q start: %v; retrying in background", link.name, err)
+			utils.Infof("[SESSION] transport %q start failed: %v; retrying in background", link.name, err)
 			s.superviseLink(link)
 		}
 	}
@@ -301,7 +307,6 @@ func (s *Session) startLink(link *transportLink) error {
 	s.mu.Unlock()
 	if stopped {
 		_ = link.batched.Stop()
-		_ = link.raw.Stop()
 		return errors.New("session stopped")
 	}
 	return nil
@@ -476,10 +481,27 @@ func (s *Session) waitReady(timeout time.Duration) error {
 		}
 		last = now
 		if remaining <= 0 || now.Sub(started) > 30*time.Minute {
+			utils.Infof("[SESSION] handshake timed out: %s", s.handshakeDiagnosis())
 			return errors.New("handshake timed out")
 		}
 	}
 	return nil
+}
+
+func (s *Session) handshakeDiagnosis() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	parts := make([]string, 0, len(s.order))
+	for _, name := range s.order {
+		l := s.links[name]
+		if l == nil {
+			continue
+		}
+		d := l.encrypted.Diagnostics()
+		parts = append(parts, fmt.Sprintf("%s(started=%t,carrier=%t,frames=%d,header_reject=%d,auth_reject=%d,decrypted=%d)",
+			name, l.started, l.raw.IsConnected(), d.RawFrames, d.BadHeader, d.BadKey, d.Decrypted))
+	}
+	return strings.Join(parts, " ")
 }
 
 // Stop tears down all transports and marks the session stopped.
@@ -496,7 +518,6 @@ func (s *Session) Stop() error {
 		s.mu.Unlock()
 		for _, l := range links {
 			_ = l.batched.Stop()
-			_ = l.raw.Stop()
 		}
 	})
 	s.wg.Wait()
@@ -570,7 +591,21 @@ func (s *Session) Transports() []string {
 func (s *Session) Receive(cb func([]byte)) {
 	s.mu.Lock()
 	s.dataCallback = cb
+	s.epochCallback = nil
 	s.mu.Unlock()
+}
+
+func (s *Session) ReceiveSessionPackets(cb func(uint64, []byte)) {
+	s.mu.Lock()
+	s.epochCallback = cb
+	s.dataCallback = nil
+	s.mu.Unlock()
+}
+
+func (s *Session) DataEpoch() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dataEpoch
 }
 
 // SetControlHandler installs the control-packet callback. Must be called
@@ -622,7 +657,22 @@ func (s *Session) helloVia(name string) error {
 // Send routes one complete IPv4 packet through the highest-priority live
 // transport (flow-hashed across ties).
 func (s *Session) Send(p []byte) error {
+	return s.sendIPv4(0, p)
+}
+
+func (s *Session) SendSessionPacket(epoch uint64, p []byte) error {
+	if epoch == 0 {
+		return errors.New("missing data epoch")
+	}
+	return s.sendIPv4(epoch, p)
+}
+
+func (s *Session) sendIPv4(epoch uint64, p []byte) error {
 	s.mu.Lock()
+	if epoch != 0 && epoch != s.dataEpoch {
+		s.mu.Unlock()
+		return errors.New("obsolete data epoch")
+	}
 	if !s.ready || s.stopped {
 		s.mu.Unlock()
 		return ErrNegotiationPending
@@ -825,6 +875,9 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 	wasReady := s.ready
 	s.peer = sender
 	if echo {
+		if !wasReady {
+			s.dataEpoch++
+		}
 		s.remote = PeerParameters{
 			Capabilities:  params.Capabilities & s.params.Capabilities,
 			MaxPacketSize: minInt(params.MaxPacketSize, s.params.MaxPacketSize),
@@ -862,6 +915,7 @@ func (s *Session) offerReplacementLocked(link *transportLink, sender [32]byte, p
 	}
 
 	if cand != nil && cand.sender == sender && env.Peer == cand.local {
+		s.dataEpoch++
 		s.local = cand.local
 		s.peer = sender
 		s.remote = PeerParameters{
@@ -951,8 +1005,11 @@ func (s *Session) receiveIPv4(link *transportLink, p []byte, env *control.Envelo
 	}
 	link.lastHeard = time.Now()
 	cb := s.dataCallback
+	epochCB, epoch := s.epochCallback, s.dataEpoch
 	s.mu.Unlock()
-	if cb != nil {
+	if epochCB != nil {
+		epochCB(epoch, append([]byte(nil), payload...))
+	} else if cb != nil {
 		cb(append([]byte(nil), payload...))
 	}
 }

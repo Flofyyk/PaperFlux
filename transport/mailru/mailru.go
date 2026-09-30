@@ -60,8 +60,9 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 type MailruDocsTransport struct {
 	*transport.BaseTransport
 
-	weblink string
-	session *DocSession
+	weblink    string
+	session    *DocSession
+	writeQueue chan []byte
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -100,6 +101,10 @@ func (t *MailruDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
+	t.Mu.Lock()
+	t.writeQueue = make(chan []byte, t.GetConfig().MaxQueueSize)
+	t.Mu.Unlock()
+	utils.SafeGo("mailru.writer", t.writerLoop)
 	utils.SafeGo("mailru.keepAlive", t.keepAliveLoop)
 	t.connectToDoc(0)
 
@@ -111,6 +116,7 @@ func (t *MailruDocsTransport) Stop() error {
 	t.Mu.Lock()
 	session := t.session
 	t.session = nil
+	t.writeQueue = nil
 	t.Mu.Unlock()
 	if session != nil && session.Conn != nil {
 		_ = session.Conn.Close()
@@ -125,14 +131,15 @@ func (t *MailruDocsTransport) Send(data []byte) error {
 
 	t.Mu.RLock()
 	session := t.session
+	queue := t.writeQueue
 	t.Mu.RUnlock()
 
-	if session == nil {
+	if session == nil || queue == nil {
 		return fmt.Errorf("no active session")
 	}
 
 	select {
-	case session.WriteQueue <- data:
+	case queue <- append([]byte(nil), data...):
 		t.RecordSend(len(data))
 		return nil
 	default:
@@ -197,9 +204,16 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		utils.Debugf("[M-DOCS] WebSocket connected")
 		conn.SetReadLimit(1 << 20)
 
-		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
-		if existingSession != nil {
-			writeQueue = existingSession.WriteQueue
+		if !t.IsRunning() {
+			_ = conn.Close()
+			return
+		}
+		t.Mu.RLock()
+		writeQueue := t.writeQueue
+		t.Mu.RUnlock()
+		if writeQueue == nil {
+			_ = conn.Close()
+			return
 		}
 
 		session := &DocSession{
@@ -214,10 +228,6 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		t.SetConnected(true)
 		t.Mu.Unlock()
 
-		if existingSession == nil {
-			utils.SafeGo("mailru.writer", t.writerLoop)
-		}
-
 		// Auth - fired immediately, same as the Yandex.Docs transport. No
 		// need to wait for the server's own "0{"/"40" handshake frames
 		// first: Mail.ru's coauthoring server buffers and processes these
@@ -226,7 +236,12 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		// (Mail.ru can delay a fresh joiner's auth confirmation by up to
 		// ~30s while it reconciles with the other participant).
 		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
+		if err := session.safeWrite(websocket.TextMessage, []byte(auth1)); err != nil {
+			_ = conn.Close()
+			t.dropSession(session)
+			t.scheduleReconnect(attempt)
+			return
+		}
 
 		authMsg := map[string]interface{}{
 			"type":                "auth",
@@ -266,15 +281,24 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			"supportAuthChangesAck": true,
 		}
 		messagePart, _ := json.Marshal([]interface{}{"message", authMsg})
-		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
+		if err := session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart)))); err != nil {
+			_ = conn.Close()
+			t.dropSession(session)
+			t.scheduleReconnect(attempt)
+			return
+		}
 
 		connectedAt := time.Now()
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		for t.IsRunning() {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[M-DOCS] Read error: %v", err)
-				t.SetConnected(false)
-				conn.Close()
+				current := t.dropSession(session)
+				_ = conn.Close()
+				if !current {
+					return
+				}
 
 				next := attempt
 				if time.Since(connectedAt) > 15*time.Second {
@@ -283,37 +307,39 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 				t.scheduleReconnect(next)
 				return
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 			t.handleMessage(session, message)
 		}
 	}()
 }
 
+// Only the reader that still owns the active connection may change state.
+func (t *MailruDocsTransport) dropSession(session *DocSession) bool {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+	if t.session != session {
+		return false
+	}
+	t.session = nil
+	t.SetConnected(false)
+	return true
+}
+
 func (t *MailruDocsTransport) writerLoop() {
-	// The write queue is created once and preserved across reconnects, so we
-	// capture it and block on it instead of polling with a sleep.
-	var queue chan []byte
-	for t.IsRunning() && queue == nil {
-		t.Mu.Lock()
-		if t.session != nil {
-			queue = t.session.WriteQueue
-		}
-		t.Mu.Unlock()
-		if queue == nil {
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	if queue == nil {
-		return
-	}
+	t.Mu.RLock()
+	queue := t.writeQueue
+	t.Mu.RUnlock()
+	done := t.Done()
 
 	var pending []byte
 	for t.IsRunning() {
 		if pending == nil {
-			packet, ok := <-queue
-			if !ok {
+			select {
+			case <-done:
 				return
+			case packet := <-queue:
+				pending = packet
 			}
-			pending = packet
 		}
 
 		t.Mu.RLock()
@@ -321,7 +347,11 @@ func (t *MailruDocsTransport) writerLoop() {
 		t.Mu.RUnlock()
 		if session == nil || session.Conn == nil {
 			// Mid-reconnect: hold the packet and retry rather than drop it.
-			time.Sleep(15 * time.Millisecond)
+			select {
+			case <-done:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
 			continue
 		}
 
@@ -329,7 +359,12 @@ func (t *MailruDocsTransport) writerLoop() {
 		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[M-DOCS] Write error: %v", err)
-			time.Sleep(15 * time.Millisecond)
+			_ = session.Conn.Close() // Wake the reader so it can reconnect.
+			select {
+			case <-done:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
 			continue // keep pending; the reconnect will bring up a new conn
 		}
 		pending = nil
@@ -342,7 +377,11 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
 
 	for t.IsRunning() {
-		<-ticker.C
+		select {
+		case <-t.Done():
+			return
+		case <-ticker.C:
+		}
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
@@ -350,7 +389,11 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[M-DOCS] Keep-alive failed: %v", err)
-				t.SetConnected(false)
+				t.Mu.RLock()
+				if t.session == session {
+					t.SetConnected(false)
+				}
+				t.Mu.RUnlock()
 				_ = session.Conn.Close()
 			}
 		}
@@ -413,7 +456,11 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 
 	d := reconnectBackoff(next)
 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)
-	time.Sleep(d)
+	select {
+	case <-t.Done():
+		return
+	case <-time.After(d):
+	}
 	if !t.IsRunning() {
 		return
 	}

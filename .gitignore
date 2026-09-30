@@ -1,6 +1,11 @@
 build/
 dist/
 github_output/
+output/
+/openflux-android-*
+/openflux-linux-*
+/openflux-*-linux-*
+/paperflux-*-linux-*
 *.exe
 *.dll
 *.so
@@ -32,6 +37,14 @@ Thumbs.db
 
 .env
 .env.local
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+.venv*/
 
 .gradle/
 *.hprof

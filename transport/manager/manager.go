@@ -10,6 +10,9 @@ package manager
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +37,7 @@ type CookieProvider interface {
 type Entry struct {
 	Name     string
 	Type     string
+	URL      string
 	Priority int
 	Raw      transport.Transport
 	Provider CookieProvider // nil if the transport does not carry cookies
@@ -120,6 +124,16 @@ func (m *Manager) Add(name, typ string, raw transport.Transport, priority int, p
 	return nil
 }
 
+// SetURL associates a carrier with its document, independently of the local
+// carrier name. The URL is only sent inside the encrypted control channel.
+func (m *Manager) SetURL(name, url string) {
+	m.mu.Lock()
+	if entry := m.entries[name]; entry != nil {
+		entry.URL = url
+	}
+	m.mu.Unlock()
+}
+
 // Remove detaches a transport from the Session and stops it.
 func (m *Manager) Remove(name string) error {
 	m.mu.Lock()
@@ -137,8 +151,12 @@ func (m *Manager) Remove(name string) error {
 	}
 	m.mu.Unlock()
 
-	_ = m.session.RemoveTransport(name)
-	_ = e.Raw.Stop()
+	if err := m.session.RemoveTransport(name); err != nil {
+		// A manager entry can be registered before its Session carrier (for
+		// example by callers using the facade only). Still release that raw
+		// transport, but do not stop registered carriers twice.
+		return e.Raw.Stop()
+	}
 	return nil
 }
 
@@ -172,18 +190,7 @@ func (m *Manager) Start() error {
 
 // Stop tears down the Session and every transport.
 func (m *Manager) Stop() error {
-	m.mu.Lock()
-	entries := make([]*Entry, 0, len(m.entries))
-	for _, e := range m.entries {
-		entries = append(entries, e)
-	}
-	m.mu.Unlock()
-
-	err := m.session.Stop()
-	for _, e := range entries {
-		_ = e.Raw.Stop()
-	}
-	return err
+	return m.session.Stop()
 }
 
 // Send routes one IPv4 packet.
@@ -263,19 +270,61 @@ func (m *Manager) AcceptCookies(name string, jar map[string]string) error {
 	return nil
 }
 
-// cookieTransport resolves the transport a cookie message refers to: the
-// named one, or for peers that predate named messages, the
-// highest-priority transport that carries cookies.
-func (m *Manager) cookieTransport(name string) string {
+// cookieTransport resolves a peer's carrier by document URL, then by its
+// local name. Older peers may omit the URL or even the name. Type fallback
+// is allowed only when there is exactly one cookie carrier of that type.
+func (m *Manager) cookieTransport(name, doc string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if name != "" {
+	if name == "" {
+		for _, n := range m.order {
+			if m.entries[n].Provider != nil {
+				return n
+			}
+		}
+		return ""
+	}
+	if doc != "" {
+		for _, n := range m.order {
+			if e := m.entries[n]; e.Provider != nil && e.URL == doc {
+				return n
+			}
+		}
+		// A matching name may refer to a different document if the client
+		// and exit enumerate URLs in a different order. An unmatched URL is
+		// safer to reject than to guess by name or type.
+		if e := m.entries[name]; e != nil && e.Provider != nil && e.URL == "" {
+			return name // An older local configuration did not record URLs.
+		}
+		return ""
+	}
+	if e := m.entries[name]; e != nil && e.Provider != nil {
 		return name
 	}
-	for _, n := range m.order {
-		if m.entries[n].Provider != nil {
-			return n
+	typ := name
+	if i := strings.LastIndexByte(name, '-'); i > 0 {
+		if _, err := strconv.Atoi(name[i+1:]); err == nil {
+			typ = name[:i]
 		}
+	}
+	match := ""
+	for _, n := range m.order {
+		e := m.entries[n]
+		if e.Provider != nil && e.Type == typ {
+			if match != "" {
+				return "" // Ambiguous: never send cookies to an arbitrary document.
+			}
+			match = n
+		}
+	}
+	return match
+}
+
+func (m *Manager) entryURL(name string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if e := m.entries[name]; e != nil {
+		return e.URL
 	}
 	return ""
 }
@@ -288,8 +337,9 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		utils.Debugf("[MANAGER] bad cookies payload: %v", err)
 		return
 	}
-	name := m.cookieTransport(cp.Transport)
+	name := m.cookieTransport(cp.Transport, cp.Doc)
 	if name == "" {
+		utils.Debugf("[MANAGER] cannot match cookie carrier %q (document supplied=%t)", cp.Transport, cp.Doc != "")
 		return
 	}
 	switch sub {
@@ -302,16 +352,72 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 			utils.Debugf("[MANAGER] fetch cookies (%s): %v", name, err)
 			return
 		}
-		body, _ := (&control.CookiesPayload{Transport: name, Jar: jar, Reason: "requested"}).Encode()
+		body, _ := (&control.CookiesPayload{Transport: name, Doc: m.entryURL(name), Jar: jar, Reason: "requested"}).Encode()
 		_ = m.SendControl(control.SubtypeCookiesResponse, body)
 	case control.SubtypeCookiesResponse, control.SubtypeCookiesOffer:
 		if len(cp.Jar) == 0 {
+			return
+		}
+		// An unchanged response must not wake a carrier out of its normal
+		// reconnect backoff or rewrite the profile cookie store.
+		if current, err := m.FetchCookiesFor(name); err == nil && maps.Equal(current, cp.Jar) {
 			return
 		}
 		if err := m.AcceptCookies(name, cp.Jar); err != nil {
 			utils.Debugf("[MANAGER] apply cookies (%s): %v", name, err)
 		}
 	}
+}
+
+// RequestPeerCookies asks the authenticated exit for each configured cookie
+// carrier. The document URL prevents an answer for a similarly named carrier
+// from being applied to another profile document.
+func (m *Manager) RequestPeerCookies() error {
+	m.mu.RLock()
+	requests := make([]control.CookiesPayload, 0, len(m.order))
+	for _, name := range m.order {
+		if e := m.entries[name]; e != nil && e.Provider != nil && e.URL != "" {
+			requests = append(requests, control.CookiesPayload{Transport: name, Doc: e.URL})
+		}
+	}
+	m.mu.RUnlock()
+	var firstErr error
+	for _, request := range requests {
+		body, err := request.Encode()
+		if err == nil {
+			err = m.SendControl(control.SubtypeCookiesRequest, body)
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// MatchingCookieCarrier confirms that a peer response was applied to the
+// intended document before the UI dismisses an outstanding auth prompt.
+func (m *Manager) MatchingCookieCarrier(name, doc string, jar map[string]string) string {
+	if len(jar) == 0 {
+		return ""
+	}
+	local := m.cookieTransport(name, doc)
+	if local == "" {
+		return ""
+	}
+	current, err := m.FetchCookiesFor(local)
+	if err != nil || !maps.Equal(current, jar) {
+		return ""
+	}
+	return local
+}
+
+// IsCookieCarrierConnected is true only after that document's raw transport
+// has established its own connection; a separate service channel is not enough.
+func (m *Manager) IsCookieCarrierConnected(name string) bool {
+	m.mu.RLock()
+	e := m.entries[name]
+	m.mu.RUnlock()
+	return e != nil && e.Provider != nil && e.Raw.IsConnected()
 }
 
 // ---- Control dispatch ----
@@ -355,6 +461,9 @@ func (m *Manager) DispatchControl(sub control.Subtype, payload []byte) {
 		if err != nil || req.Transport == "" {
 			utils.Debugf("[MANAGER] bad AuthRequired payload: %v", err)
 			return
+		}
+		if local := m.cookieTransport(req.Transport, req.Doc); local == "" {
+			utils.Debugf("[MANAGER] cannot match auth carrier %q (document supplied=%t)", req.Transport, req.Doc != "")
 		}
 		m.mu.RLock()
 		cb := m.remoteAuth
@@ -509,7 +618,7 @@ func (m *Manager) forwardAuth(name, url, reason string) {
 	m.authSent[name] = now
 	m.mu.Unlock()
 
-	body, _ := (&control.AuthRequiredPayload{Transport: name, URL: url, Reason: reason}).Encode()
+	body, _ := (&control.AuthRequiredPayload{Transport: name, URL: url, Reason: reason, Doc: m.entryURL(name)}).Encode()
 	if err := m.SendControl(control.SubtypeAuthRequired, body); err != nil {
 		// No client yet: let the transport's next report try again.
 		utils.Debugf("[MANAGER] forward AuthRequired (%s): %v", name, err)
@@ -531,6 +640,9 @@ func (m *Manager) SetRemoteAuthNotifier(n CaptchaNotifier) {
 // OfferCookies sends a jar for one of the peer's transports (the answer to
 // an AuthRequired report).
 func (m *Manager) OfferCookies(name string, jar map[string]string) error {
+	// name comes from the exit's AuthRequired request. It is the exit's
+	// name, not necessarily this side's entry; attaching a local document
+	// URL here could reroute the answer to a different exit carrier.
 	body, err := (&control.CookiesPayload{Transport: name, Jar: jar, Reason: "solved"}).Encode()
 	if err != nil {
 		return err

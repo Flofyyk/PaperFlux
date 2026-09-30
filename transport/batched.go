@@ -34,10 +34,12 @@ const (
 type BatchedTransport struct {
 	Transport
 
-	queue         chan []byte
-	lingerMs      int
-	maxBatchBytes int
-	maxBatchCount int
+	queue          chan []byte
+	queueByteLimit int64
+	queueBytes     atomic.Int64
+	lingerMs       int
+	maxBatchBytes  int
+	maxBatchCount  int
 
 	running    atomic.Bool
 	lifecycle  sync.Mutex
@@ -61,13 +63,21 @@ func envInt(name string, def int) int {
 }
 
 func NewBatchedTransport(inner Transport) *BatchedTransport {
+	return newBatchedTransportWithBudget(inner, 16<<20)
+}
+
+func newBatchedTransportWithBudget(inner Transport, budget int64) *BatchedTransport {
+	if budget <= 0 {
+		budget = 16 << 20
+	}
 	return &BatchedTransport{
-		Transport:     inner,
-		queue:         make(chan []byte, batchQueueDepth),
-		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
-		maxBatchBytes: min(envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes), maxFrameBytes-65537),
-		maxBatchCount: min(envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount), maxFrameRecords-1),
-		stopCh:        make(chan struct{}),
+		Transport:      inner,
+		queue:          make(chan []byte, batchQueueDepth),
+		queueByteLimit: budget,
+		lingerMs:       envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
+		maxBatchBytes:  min(envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes), maxFrameBytes-65537),
+		maxBatchCount:  min(envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount), maxFrameRecords-1),
+		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -103,7 +113,14 @@ func (b *BatchedTransport) Stop() error {
 	}
 	b.running.Store(false)
 	b.stopOnce.Do(func() { close(b.stopCh) })
-	return b.Transport.Stop()
+	for {
+		select {
+		case p := <-b.queue:
+			b.queueBytes.Add(-int64(len(p)))
+		default:
+			return b.Transport.Stop()
+		}
+	}
 }
 
 // Send copies the packet (the caller's buffer may be reused) and enqueues it
@@ -118,12 +135,17 @@ func (b *BatchedTransport) Send(data []byte) error {
 	if len(data) > 65535 {
 		return fmt.Errorf("packet too large for batch record: %d bytes", len(data))
 	}
+	if b.queueBytes.Load()+int64(len(data)) > b.queueByteLimit {
+		return fmt.Errorf("batch byte budget full")
+	}
 	p := make([]byte, len(data))
 	copy(p, data)
+	b.queueBytes.Add(int64(len(p)))
 	select {
 	case b.queue <- p:
 		return nil
 	default:
+		b.queueBytes.Add(-int64(len(p)))
 		return fmt.Errorf("batch queue full")
 	}
 }
@@ -175,6 +197,7 @@ func (b *BatchedTransport) flushLoop() {
 		case <-b.stopCh:
 			return
 		case first = <-b.queue:
+			b.queueBytes.Add(-int64(len(first)))
 		}
 		batch := [][]byte{first}
 		size := 2 + len(first)
@@ -185,6 +208,7 @@ func (b *BatchedTransport) flushLoop() {
 		for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			select {
 			case p := <-b.queue:
+				b.queueBytes.Add(-int64(len(p)))
 				batch = append(batch, p)
 				size += 2 + len(p)
 			default:
@@ -204,6 +228,7 @@ func (b *BatchedTransport) flushLoop() {
 					timer.Stop()
 					return
 				case p := <-b.queue:
+					b.queueBytes.Add(-int64(len(p)))
 					batch = append(batch, p)
 					size += 2 + len(p)
 				case <-timer.C:

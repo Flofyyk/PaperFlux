@@ -23,6 +23,15 @@ type Transport interface {
 	Stats() TransportStats
 }
 
+// SessionPackets is optional local metadata, not a wire-protocol change.
+// Epoch changes only after a new peer/challenge has been authenticated.
+// Exit stacks can discard obsolete connections and late queued packets.
+type SessionPackets interface {
+	ReceiveSessionPackets(callback func(epoch uint64, packet []byte))
+	DataEpoch() uint64
+	SendSessionPacket(epoch uint64, packet []byte) error
+}
+
 type TransportStats struct {
 	BytesSent     uint64
 	BytesReceived uint64
@@ -152,6 +161,9 @@ func (b *BaseTransport) GetSession(accessor func(interface{})) {
 }
 
 func (b *BaseTransport) Stats() TransportStats {
+	b.Mu.RLock()
+	startTime := b.startTime
+	b.Mu.RUnlock()
 	return TransportStats{
 		BytesSent:     atomic.LoadUint64(&b.stats.BytesSent),
 		BytesReceived: atomic.LoadUint64(&b.stats.BytesReceived),
@@ -159,7 +171,7 @@ func (b *BaseTransport) Stats() TransportStats {
 		PacketsRecv:   atomic.LoadUint64(&b.stats.PacketsRecv),
 		Reconnects:    uint64(b.reconnectAttempts.Load()),
 		Connected:     b.IsConnected(),
-		Uptime:        time.Since(b.startTime),
+		Uptime:        time.Since(startTime),
 	}
 }
 

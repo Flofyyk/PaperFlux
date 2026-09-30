@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"sync"
@@ -31,7 +32,10 @@ type Profile struct {
 	Transport    string   `json:"transport"`
 	DocumentURL  string   `json:"documentUrl,omitempty"`
 	DocumentURLs []string `json:"documentUrls,omitempty"`
+	VolgaURL     string   `json:"volgaUrl,omitempty"`
 }
+
+var volgaDocumentRE = regexp.MustCompile(`^https://disk\.yandex\.ru/i/[A-Za-z0-9_-]+$`)
 
 func Sign(secret, label string, data []byte) []byte {
 	h := hmac.New(sha256.New, []byte(secret))
@@ -70,6 +74,16 @@ func LoadFile(path string) ([]Profile, error) {
 		}
 		if len(p.DocumentURLs) == 0 && p.DocumentURL == "" {
 			return nil, errors.New("profile resource is missing")
+		}
+		if p.VolgaURL != "" {
+			if p.Transport != "yandex" || !volgaDocumentRE.MatchString(p.VolgaURL) || p.VolgaURL == p.DocumentURL {
+				return nil, errors.New("invalid Volga resource")
+			}
+			for _, document := range p.DocumentURLs {
+				if p.VolgaURL == document {
+					return nil, errors.New("Volga document must be separate")
+				}
+			}
 		}
 		body, _ := json.Marshal(p)
 		if len(body) > MaxPayload {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/scrypt"
 )
@@ -41,6 +42,27 @@ type EncryptedTransport struct {
 	seenMu        sync.Mutex
 	seen          map[string]struct{}
 	seenOrder     []string
+	rawFrames     atomic.Uint64
+	badHeader     atomic.Uint64
+	badKey        atomic.Uint64
+	decrypted     atomic.Uint64
+}
+
+// EncryptionDiagnostics contains counters, never keys or packet contents.
+// A valid header with failed authentication usually means a different
+// profile token or KDF context on the peer.
+type EncryptionDiagnostics struct {
+	RawFrames uint64
+	BadHeader uint64
+	BadKey    uint64
+	Decrypted uint64
+}
+
+func (e *EncryptedTransport) Diagnostics() EncryptionDiagnostics {
+	return EncryptionDiagnostics{
+		RawFrames: e.rawFrames.Load(), BadHeader: e.badHeader.Load(),
+		BadKey: e.badKey.Load(), Decrypted: e.decrypted.Load(),
+	}
 }
 
 // NewEncryptedTransport wraps inner with a directional AES-256-GCM stream.
@@ -54,19 +76,35 @@ func NewEncryptedTransport(inner Transport, secret, context string, exitNode boo
 	if len(secret) < 16 {
 		return nil, errors.New("encryption secret must contain at least 16 characters")
 	}
+	keys, err := deriveEncryptionKeys(secret, context)
+	if err != nil {
+		return nil, err
+	}
+	return wrapEncryptionKeys(inner, keys, exitNode)
+}
 
+type encryptionKeys struct{ clientToExit, exitToClient []byte }
+
+func deriveEncryptionKeys(secret, context string) (encryptionKeys, error) {
+	if len(secret) < 16 {
+		return encryptionKeys{}, errors.New("encryption secret must contain at least 16 characters")
+	}
 	salt := sha256.Sum256([]byte("OpenFlux encrypted transport v1\x00" + context))
 	master, err := scrypt.Key([]byte(secret), salt[:], 32768, 8, 1, 32)
 	if err != nil {
-		return nil, fmt.Errorf("derive encryption key: %w", err)
+		return encryptionKeys{}, fmt.Errorf("derive encryption key: %w", err)
 	}
 	clientToExit := deriveDirectionalKey(master, "client-to-exit")
 	exitToClient := deriveDirectionalKey(master, "exit-to-client")
+	clear(master)
+	return encryptionKeys{clientToExit, exitToClient}, nil
+}
 
-	sendKey, receiveKey := clientToExit, exitToClient
+func wrapEncryptionKeys(inner Transport, keys encryptionKeys, exitNode bool) (*EncryptedTransport, error) {
+	sendKey, receiveKey := keys.clientToExit, keys.exitToClient
 	sendDirection, receiveDirection := byte(0), byte(1)
 	if exitNode {
-		sendKey, receiveKey = exitToClient, clientToExit
+		sendKey, receiveKey = keys.exitToClient, keys.clientToExit
 		sendDirection, receiveDirection = 1, 0
 	}
 	sendAEAD, err := newGCM(sendKey)
@@ -120,21 +158,29 @@ func (e *EncryptedTransport) Send(data []byte) error {
 
 func (e *EncryptedTransport) Receive(callback func([]byte)) {
 	e.Transport.Receive(func(packet []byte) {
+		e.rawFrames.Add(1)
 		if len(packet) < encryptedHeader+e.receiveAEAD.NonceSize()+e.receiveAEAD.Overhead() {
+			e.badHeader.Add(1)
 			return
 		}
 		header := packet[:encryptedHeader]
 		if header[0] != encryptedMagic[0] || header[1] != encryptedMagic[1] ||
 			header[2] != encryptedMagic[2] || header[3] != encryptedVersion ||
 			header[4] != e.recvDirection {
+			e.badHeader.Add(1)
 			return
 		}
 		nonceEnd := encryptedHeader + e.receiveAEAD.NonceSize()
 		nonce := packet[encryptedHeader:nonceEnd]
 		plaintext, err := e.receiveAEAD.Open(nil, nonce, packet[nonceEnd:], header)
-		if err != nil || !e.rememberNonce(nonce) {
+		if err != nil {
+			e.badKey.Add(1)
 			return
 		}
+		if !e.rememberNonce(nonce) {
+			return
+		}
+		e.decrypted.Add(1)
 		callback(plaintext)
 	})
 }

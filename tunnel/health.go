@@ -45,12 +45,16 @@ func (t *TCPTunnel) RunHealthChecks() {
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		<-tick.C
+		select {
+		case <-t.lifecycleContext.Done():
+			return
+		case <-tick.C:
+		}
 		carrierReady := t.transport.IsConnected()
 		if !schedule.due(time.Now(), carrierReady) {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		ctx, cancel := context.WithTimeout(t.lifecycleContext, 6*time.Second)
 		err := t.Probe(ctx)
 		cancel()
 		schedule.completed(time.Now(), err == nil)
