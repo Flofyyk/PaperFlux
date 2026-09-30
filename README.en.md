@@ -1,56 +1,84 @@
 # PaperFlux Server
 
-[Русский](README.md) · **English** · [Android client](https://github.com/Flofyyk/PaperFluxAndroid)
+[Русский](README.md) · **English** · [Android client](https://github.com/Flofyyk/PaperFluxAndroid) · [Releases](https://github.com/Flofyyk/PaperFlux/releases/latest)
 
-PaperFlux is a TCP tunnel that carries data through Yandex Docs. The client accepts application traffic; a VPS exit node forwards it to the destination and sends responses back through the same channel.
+PaperFlux VPN tunnel server with Yandex Docs and Mail.ru Docs transports. Receives client traffic through a document channel and forwards it to the internet.
 
-Based on [OpenFlux](https://github.com/p1neappleXpress/OpenFlux), this repository contains the server and shared PaperFlux transport core.
+## Features
+
+- Authenticated encrypted sessions with a separate access key for each profile.
+- Two Yandex Docs channels and an optional Volga fallback channel.
+- Automatic reconnection and DNS/TCP readiness checks.
+- Bounded queues, traffic rate limits and active-flow limits.
+- Rootless IPv4 TCP/UDP forwarding in `proxy` mode and Linux packet forwarding in `raw` mode.
+- Experimental grouped proxy for independent profiles sharing one process.
 
 ## How it works
 
 ```text
-Android apps ↔ VPN/TCP stack ↔ Session / legacy PFS2
-                                 ↕
-                  Yandex Docs collaboration channel
-                                 ↕
-                         VPS ↔ destination
+Android client ↔ document transport ↔ PaperFlux Server ↔ internet
 ```
 
-The Android client processes VPN-interface packets through a local network stack. A SOCKS5 entry point is also available for desktop clients.
+The client and server join the same documents. Data is batched, compressed and carried through an encrypted session. The VPS reconstructs packets and handles outbound connections; replies follow the reverse path.
 
-Both endpoints join the same Yandex document. The transport batches and encrypts data, then encodes it inside cursor messages sent through Socket.IO over Engine.IO/WebSocket. Packet content does not need to be written into the document text.
+The main Yandex Docs transport uses collaboration cursor messages without writing traffic into document text. Volga uses text operations and requires a separate empty document with editing access.
 
-The VPS decodes these messages and forwards TCP traffic. The `proxy` mode uses ordinary outbound sockets without root; `raw` retains packet forwarding with Linux-specific setup. Responses follow the reverse path.
+If one document channel disconnects, the remaining channel continues carrying traffic while the disconnected channel recovers independently. Tunnel readiness requires document authorization, an authenticated session and successful DNS/TCP checks.
 
-## Secure sessions and recovery
+## Deployment
 
-The current Session authenticates peers with profile credentials, negotiates capabilities and encrypts messages with directional AES-256-GCM. Legacy PFS2 with X25519 remains a separate compatibility mode. Application data is accepted only after session confirmation. Encryption covers the client-to-VPS path; protection beyond the VPS depends on the application's protocol, such as HTTPS.
+Linux `amd64` and `arm64` binaries are available in [releases](https://github.com/Flofyyk/PaperFlux/releases/latest). Use `uname -m` to select an architecture: `x86_64` maps to `amd64`, and `aarch64` maps to `arm64`.
 
-The document service can observe message timing and sizes. See [PFS2](docs/SECURITY_PFS2.md) for details.
+1. Install the binary on your VPS.
+2. Prepare a document and profile settings: ID, access key and client virtual IP.
+3. Run the server with `--session` and configure a systemd service.
+4. Add the matching profile to the Android client.
 
-Connection readiness requires document authentication, a secure peer session and DNS/TCP verification. After a disconnect, the transport fetches document parameters again and creates a fresh WebSocket session. Retries use exponential delays with jitter; expired queued packets are discarded.
+Single-profile example:
 
-Session supports one or two Yandex documents. TCP flows use available document lanes; losing one lane does not require replacing the entire VPN. Restarted exit nodes are rediscovered using a fresh challenge before peer replacement. Restored lanes trigger immediate Android DNS/TCP verification. Collaborative editor authentication locks are completed without changing document content.
+```bash
+./paperflux --exit-node --session --mode proxy \
+  --transport yandex \
+  --urls "https://disk.yandex.ru/i/DOCUMENT_ID" \
+  --client-ip 10.10.10.2 \
+  --profile-id 1 \
+  --profile-token "REPLACE_WITH_RANDOM_PROFILE_KEY"
+```
 
-## Compatibility and documentation
+Replace the example document URL and key. Both endpoints must use matching IDs, keys, virtual IPs and transport settings.
 
-The primary configuration is PaperFlux Android with a compatible PaperFlux server over Yandex Docs. Proxy mode forwards IPv4 TCP and UDP through ordinary outbound sockets. IPv6 is not supported.
+The [deployment guide](docs/DEPLOYMENT.md) covers service users, systemd and upgrades. `raw` mode requires root and additional Linux configuration. IPv6 is not supported. Legacy PFS2 is not compatible with Session.
 
-Server 0.5.6–0.5.8 and Android 0.4.14–0.4.16 use compatible Session protocols and require `--session` on the server. Legacy PFS2 clients are not compatible with Session. Address-and-key setup requires the optional profile discovery service; complete profile import does not. Volga requires an empty document because it modifies its content. An optional encrypted verification-only channel helps with server-side Yandex CAPTCHA without carrying normal VPN traffic.
+## Documentation
 
-In 0.5.8, the grouped proxy resets its network stack and closes old TCP/UDP flows when the authenticated client session changes. Late packets and replies from the previous session are rejected. Ordinary document rotation retains active flows. The Session wire format is unchanged.
+The following guides are in Russian:
 
-Linux `amd64` and `arm64` binaries are available in the [latest release](https://github.com/Flofyyk/PaperFlux/releases/latest). `uname -m` reports `x86_64` for amd64 and `aarch64` for arm64.
+- [Deployment](docs/DEPLOYMENT.md)
+- [Transports and Yandex authorization](docs/TRANSPORTS.md)
+- [Android client setup](docs/PAPERFLUX.md)
+- [Profile discovery and sharing](docs/PROFILES.md)
+- [Multiple users and backup servers](docs/MULTIUSER.md)
+- [Experimental grouped proxy](docs/EXPERIMENTAL_GROUPS.md)
+- [Legacy PFS2](docs/SECURITY_PFS2.md)
 
-- [Linux VPS deployment](docs/DEPLOYMENT.md) (Russian)
-- [Android profiles and connection](docs/PAPERFLUX.md) (Russian)
-- [Profile discovery and sharing](docs/PROFILES.md) (Russian) — optional encrypted setup by server address and access key, independent of any bot or VPS provider.
-- [PFS2 protocol](docs/SECURITY_PFS2.md) (Russian)
-- [Transports and Yandex verification](docs/TRANSPORTS.md) (Russian)
-- [Experimental grouped proxy](docs/EXPERIMENTAL_GROUPS.md) (Russian) — bounded shared processes; not a claim of production capacity.
+## Build
 
-## License and use
+Go 1.26.4 or newer is required. On Linux:
 
-[GPL-3.0-or-later](LICENSE); third-party notices are in [NOTICE](NOTICE).
+```bash
+git clone https://github.com/Flofyyk/PaperFlux.git
+cd PaperFlux
+go build -trimpath -o paperflux .
+```
 
-For education and research on systems you own or are authorized to use. Provided as is, without warranties. Users are responsible for their deployments and use.
+Use [build-android-native.ps1](scripts/build-android-native.ps1) with Android NDK to rebuild the Android core.
+
+## Security
+
+Session uses AES-256-GCM to encrypt the client-to-VPS connection. Protection beyond the VPS depends on application protocols such as HTTPS. The document service can observe exchange timing and volume. Profile configurations contain access keys and should only be shared with trusted recipients.
+
+## License
+
+[GPL-3.0-or-later](LICENSE). Third-party components are listed in [NOTICE](NOTICE). Based on [OpenFlux](https://github.com/p1neappleXpress/OpenFlux).
+
+Provided as is, without warranties. Use on systems you own or are authorized to access.
