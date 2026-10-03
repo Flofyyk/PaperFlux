@@ -2,6 +2,7 @@ package transport
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"sync"
@@ -26,6 +27,7 @@ type MultiTransport struct {
 	receiveStop  chan struct{}
 	lastCleanup  time.Time
 	lastReady    atomic.Int32
+	selector     laneSelector
 }
 
 type flowBinding struct {
@@ -98,6 +100,7 @@ func (m *MultiTransport) monitorLanes() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for m.IsRunning() {
+		_ = m.pickAdaptiveLane()
 		ready, total := m.LaneStatus()
 		if int32(ready) != m.lastReady.Swap(int32(ready)) {
 			log.Printf("[PAPERFLUX_LANES] ready=%d/%d", ready, total)
@@ -187,9 +190,12 @@ func (m *MultiTransport) Send(packet []byte) error {
 	if key == "" {
 		start := m.pickAdaptiveLane()
 		for offset := range m.lanes {
-			lane := m.lanes[(start+offset)%len(m.lanes)]
+			index := (start + offset) % len(m.lanes)
+			lane := m.lanes[index]
 			if lane.IsConnected() {
-				if err := lane.Send(packet); err == nil {
+				err := lane.Send(packet)
+				m.selector.noteResult(fmt.Sprint(index), err)
+				if err == nil {
 					m.RecordSend(len(packet))
 					return nil
 				}
@@ -222,17 +228,20 @@ func (m *MultiTransport) Send(packet []byte) error {
 	if start < 0 {
 		start = m.pickLane()
 	}
+	if m.selector.isDemoted(fmt.Sprint(start)) {
+		start = m.pickLane()
+	}
 	for offset := 0; offset < len(m.lanes); offset++ {
 		lane := m.lanes[(start+offset)%len(m.lanes)]
 		if !lane.IsConnected() {
 			continue
 		}
-		// Keep headroom on each lane. If another document is ready, a new flow
-		// should use it instead of waiting for a nearly full writer queue.
-		if load, ok := lane.(queueLoadReporter); ok && load.QueueLoad() >= 0.75 {
-			continue
-		}
-		if err := lane.Send(packet); err == nil {
+		// Queue occupancy influences new-flow selection, not admission. Even
+		// an overloaded lane must get a bounded chance to drain when every
+		// document is busy; skipping all of them silently loses the packet.
+		err := lane.Send(packet)
+		m.selector.noteResult(fmt.Sprint((start+offset)%len(m.lanes)), err)
+		if err == nil {
 			m.bindFlowLane(key, (start+offset)%len(m.lanes))
 			m.RecordSend(len(packet))
 			return nil
@@ -283,34 +292,7 @@ func (m *MultiTransport) cleanupLocked(now time.Time) {
 }
 
 func (m *MultiTransport) pickLane() int {
-	if len(m.lanes) == 0 {
-		return 0
-	}
-	best := -1
-	bestScore := 0.0
-	start := int(m.rr.Add(1)-1) % len(m.lanes)
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for i, lane := range m.lanes {
-		if !lane.IsConnected() {
-			continue
-		}
-		health := laneHealth(lane)
-		// The writer queue is the earliest congestion signal. RTT is useful once
-		// queues are similarly empty, while active flow count keeps an otherwise
-		// equal pair evenly spread.  A flow is selected only once and is pinned
-		// afterwards, so this cannot reorder an established TCP connection.
-		score := health.QueueLoad*10_000 + float64(health.RTT.Milliseconds()) + float64(m.activeFlows[i])*5
-		rotation := (i - start + len(m.lanes)) % len(m.lanes)
-		bestRotation := (best - start + len(m.lanes)) % len(m.lanes)
-		if best < 0 || score < bestScore || (score == bestScore && rotation < bestRotation) {
-			best, bestScore = i, score
-		}
-	}
-	if best >= 0 {
-		return best
-	}
-	return int(m.rr.Add(1)-1) % len(m.lanes)
+	return m.pickAdaptiveLane()
 }
 
 // pickAdaptiveLane is used for bond envelopes and control frames, which do
@@ -321,20 +303,13 @@ func (m *MultiTransport) pickAdaptiveLane() int {
 	if len(m.lanes) == 0 {
 		return 0
 	}
-	best := -1
-	bestScore := 0.0
+	candidates := make([]laneCandidate, 0, len(m.lanes))
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	for index, lane := range m.lanes {
-		health := laneHealth(lane)
-		if !health.Connected {
-			continue
-		}
-		score := health.QueueLoad*10_000 + float64(health.RTT.Milliseconds()) + float64(m.activeFlows[index])*5
-		if best < 0 || score < bestScore {
-			best, bestScore = index, score
-		}
+		candidates = append(candidates, laneCandidate{name: fmt.Sprint(index), health: laneHealth(lane), stats: lane.Stats(), flows: m.activeFlows[index]})
 	}
+	m.mu.RUnlock()
+	best := m.selector.pick(candidates, "", int(m.rr.Add(1)-1)%len(m.lanes), time.Now())
 	if best >= 0 {
 		return best
 	}
@@ -406,6 +381,8 @@ func (m *MultiTransport) Stats() TransportStats {
 		s.RetryQueued += ls.RetryQueued
 		s.ExpiredDrops += ls.ExpiredDrops
 		s.WriteFailures += ls.WriteFailures
+		s.QueueWaits += ls.QueueWaits
+		s.QueueTimeouts += ls.QueueTimeouts
 	}
 	s.Connected = m.IsConnected()
 	return s

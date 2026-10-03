@@ -1409,10 +1409,6 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		log.Printf("[PAPERFLUX] peer profile identity received")
 		return
 	}
-	if strings.Contains(text, "---KA---") {
-		return
-	}
-
 	// Socket.IO ping - respond with pong (use safeWrite)
 	if text == "2" {
 		if session != nil && session.Conn != nil {
@@ -1444,106 +1440,105 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 
 	if strings.Contains(text, "saveChanges") || strings.Contains(text, "cursor") {
-		base64Str := t.extractBase64String(text)
-		if base64Str == "" {
-			if session != nil && session.diagSecure.Add(1) <= 4 {
-				log.Printf("[PAPERFLUX] secure frame ignored: editor event contained no supported payload")
-			}
-			return
+		for _, payload := range transport.EditorPayloads(text) {
+			t.handleSecurePayload(session, payload)
 		}
-		if len(base64Str) > base64.StdEncoding.EncodedLen(maxSecureFrame+secureHeader+16) {
-			return
-		}
+	}
+}
 
-		decoded, err := base64.StdEncoding.DecodeString(base64Str)
-		if err != nil {
-			utils.Debugf("[YDOCS] Base64 decode error: %v", err)
-			return
+func (t *YandexDocsTransport) handleSecurePayload(session *DocSession, base64Str string) {
+	if len(base64Str) > base64.StdEncoding.EncodedLen(maxSecureFrame+secureHeader+16) {
+		return
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(base64Str)
+	if err != nil {
+		utils.Debugf("[YDOCS] Base64 decode error: %v", err)
+		return
+	}
+	if len(decoded) >= 5 && bytes.Equal(decoded[:4], secureMagic) && (decoded[4] == 1 || decoded[4] == 2) {
+		if session != nil && session.diagSecure.Add(1) <= 8 {
+			log.Printf("[PAPERFLUX] PFS2 handshake received kind=%d bytes=%d", decoded[4], len(decoded))
 		}
-		if len(decoded) >= 5 && bytes.Equal(decoded[:4], secureMagic) && (decoded[4] == 1 || decoded[4] == 2) {
+		if ack, e := t.secure.receiveHandshake(decoded); e == nil && ack != nil {
 			if session != nil && session.diagSecure.Add(1) <= 8 {
-				log.Printf("[PAPERFLUX] PFS2 handshake received kind=%d bytes=%d", decoded[4], len(decoded))
+				log.Printf("[PAPERFLUX] PFS2 handshake accepted; sending acknowledgement")
 			}
-			if ack, e := t.secure.receiveHandshake(decoded); e == nil && ack != nil {
-				if session != nil && session.diagSecure.Add(1) <= 8 {
-					log.Printf("[PAPERFLUX] PFS2 handshake accepted; sending acknowledgement")
-				}
-				_ = t.writeSecureFrame(session, ack)
-			} else if e != nil && session != nil && session.diagSecure.Add(1) <= 8 {
-				// The event body is intentionally not logged: it can contain editor
-				// metadata.  Kind and byte length are sufficient to diagnose protocol
-				// compatibility without exposing document content or credentials.
-				log.Printf("[PAPERFLUX] PFS2 handshake rejected kind=%d bytes=%d", decoded[4], len(decoded))
-			}
-			// If this was the peer ACK, the channel is now ready. Send the
-			// authenticated liveness challenge in the same turn instead of
-			// waiting for the periodic keepalive.
-			t.startSecureSession(session, false)
-			return
+			_ = t.writeSecureFrame(session, ack)
+		} else if e != nil && session != nil && session.diagSecure.Add(1) <= 8 {
+			// The event body is intentionally not logged: it can contain editor
+			// metadata.  Kind and byte length are sufficient to diagnose protocol
+			// compatibility without exposing document content or credentials.
+			log.Printf("[PAPERFLUX] PFS2 handshake rejected kind=%d bytes=%d", decoded[4], len(decoded))
 		}
-		decoded, err = t.secure.open(decoded)
-		if err != nil {
-			return
+		// If this was the peer ACK, the channel is now ready. Send the
+		// authenticated liveness challenge in the same turn instead of
+		// waiting for the periodic keepalive.
+		t.startSecureSession(session, false)
+		return
+	}
+	decoded, err = t.secure.open(decoded)
+	if err != nil {
+		return
+	}
+	if len(decoded) == 17 && decoded[0] == 1 {
+		// Compatibility with a client still being upgraded. New endpoints use
+		// the ID-bearing 25-byte format below, but accepting the legacy probe
+		// keeps a server-first rollout from interrupting an active session.
+		decoded[0] = 2
+		if sealed, e := t.secure.seal(decoded); e == nil {
+			_ = t.writeSecureFrame(session, sealed)
 		}
-		if len(decoded) == 17 && decoded[0] == 1 {
-			// Compatibility with a client still being upgraded. New endpoints use
-			// the ID-bearing 25-byte format below, but accepting the legacy probe
-			// keeps a server-first rollout from interrupting an active session.
-			decoded[0] = 2
-			if sealed, e := t.secure.seal(decoded); e == nil {
-				_ = t.writeSecureFrame(session, sealed)
-			}
-			return
+		return
+	}
+	if len(decoded) == 25 && decoded[0] == 1 {
+		decoded[0] = 2
+		if sealed, e := t.secure.seal(decoded); e == nil {
+			_ = t.writeSecureFrame(session, sealed)
 		}
-		if len(decoded) == 25 && decoded[0] == 1 {
-			decoded[0] = 2
-			if sealed, e := t.secure.seal(decoded); e == nil {
-				_ = t.writeSecureFrame(session, sealed)
-			}
-			return
+		return
+	}
+	if len(decoded) == 25 && decoded[0] == 2 {
+		id := binary.BigEndian.Uint64(decoded[1:9])
+		t.proofMu.Lock()
+		proof, valid := t.pendingProof[id]
+		if valid && !bytes.Equal(decoded[9:], proof.nonce[:]) {
+			valid = false
 		}
-		if len(decoded) == 25 && decoded[0] == 2 {
-			id := binary.BigEndian.Uint64(decoded[1:9])
-			t.proofMu.Lock()
-			proof, valid := t.pendingProof[id]
-			if valid && !bytes.Equal(decoded[9:], proof.nonce[:]) {
-				valid = false
-			}
-			if valid {
-				delete(t.pendingProof, id)
-			}
-			rtt := time.Since(proof.sent).Milliseconds()
-			t.proofMu.Unlock()
-			if valid {
-				t.lastProof.Store(time.Now().UnixNano())
-				if session != nil {
-					session.proofAt.Store(time.Now().UnixNano())
-					session.pingMs.Store(rtt)
-				}
-				if !t.peerReady.Swap(true) {
-					t.peerReadyAt.Store(time.Now().UnixNano())
-					// Reset reconnect backoff only after both the editor session and
-					// the encrypted peer path are proven. An auth reply followed by
-					// an immediate 1005 must still back off instead of churning the
-					// document participant every 1.5 seconds.
-					t.failedAttempts.Store(0)
-					t.captchaUntil.Store(0)
-					log.Printf("[PAPERFLUX] PEER_READY: encrypted exit channel confirmed")
-				}
-			}
-			return
+		if valid {
+			delete(t.pendingProof, id)
 		}
+		rtt := time.Since(proof.sent).Milliseconds()
+		t.proofMu.Unlock()
+		if valid {
+			t.lastProof.Store(time.Now().UnixNano())
+			if session != nil {
+				session.proofAt.Store(time.Now().UnixNano())
+				session.pingMs.Store(rtt)
+			}
+			if !t.peerReady.Swap(true) {
+				t.peerReadyAt.Store(time.Now().UnixNano())
+				// Reset reconnect backoff only after both the editor session and
+				// the encrypted peer path are proven. An auth reply followed by
+				// an immediate 1005 must still back off instead of churning the
+				// document participant every 1.5 seconds.
+				t.failedAttempts.Store(0)
+				t.captchaUntil.Store(0)
+				log.Printf("[PAPERFLUX] PEER_READY: encrypted exit channel confirmed")
+			}
+		}
+		return
+	}
 
-		// Only our versioned batch format is tunnel data.  OnlyOffice cursor
-		// events may contain unrelated base64 text; forwarding a decoded cursor
-		// as a raw IP packet fabricated random SYNs and saturated the exit node.
-		// Both peers emit PFMB/1, so reject any legacy/unframed payload strictly.
-		if !unpackBatch(decoded, func(packet []byte) {
-			t.RecordReceive(len(packet))
-			t.CallReceive(packet)
-		}) {
-			return
-		}
+	// Only our versioned batch format is tunnel data.  OnlyOffice cursor
+	// events may contain unrelated base64 text; forwarding a decoded cursor
+	// as a raw IP packet fabricated random SYNs and saturated the exit node.
+	// Both peers emit PFMB/1, so reject any legacy/unframed payload strictly.
+	if !unpackBatch(decoded, func(packet []byte) {
+		t.RecordReceive(len(packet))
+		t.CallReceive(packet)
+	}) {
+		return
 	}
 }
 

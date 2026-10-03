@@ -86,6 +86,16 @@ func (t *Transport) Stats() transport.TransportStats {
 	return s
 }
 
+func (t *Transport) LaneHealth() transport.LaneHealth {
+	h := transport.LaneHealth{Connected: t.IsConnected()}
+	if reporter, ok := t.raw.(transport.LaneHealthReporter); ok {
+		h = reporter.LaneHealth()
+		h.Connected = t.IsConnected()
+	}
+	h.RTT = time.Duration(t.rttMs.Load()) * time.Millisecond
+	return h
+}
+
 func (t *Transport) Send(data []byte) error {
 	if !t.IsConnected() {
 		return fmt.Errorf("secure peer not ready")

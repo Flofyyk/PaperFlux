@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	buildVersion = "0.5.8"
+	buildVersion = "0.5.9"
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
@@ -48,6 +48,7 @@ func main() {
 	authAddress := flag.String("auth-service", "", "Encrypted verification-only listener (exit) or address (client)")
 	clientIPFlag := flag.String("client-ip", "10.10.10.2", "Virtual IPv4 address for this Android worker")
 	exitModeFlag := flag.String("mode", "raw", "Exit-node mode: raw or proxy")
+	tcpRecoveryFlag := flag.String("tcp-recovery", os.Getenv("PAPERFLUX_TCP_RECOVERY"), "Experimental document TCP recovery: default or classic (A/B only)")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, cupsonline, mailru, oneme, relayv2)")
 	documentURLs := flag.String("urls", "", "Comma-separated Yandex Docs URLs for parallel document lanes")
 	volgaURL := flag.String("volga-url", "", "Dedicated empty editable Yandex document for the optional Volga fallback lane")
@@ -65,6 +66,19 @@ func main() {
 	if *showVersion {
 		fmt.Println("PaperFlux " + buildVersion)
 		return
+	}
+	tcpRecoveryMode, err := tunnel.ParseTCPRecoveryMode(*tcpRecoveryFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if tcpRecoveryMode == "classic" && *transportType != "yandex" && *transportType != "vyandex" && *transportType != "mailru" {
+		log.Fatal("classic TCP recovery is experimental and restricted to document transports")
+	}
+	if err := os.Setenv("PAPERFLUX_TCP_RECOVERY", tcpRecoveryMode); err != nil {
+		log.Fatal("cannot configure TCP recovery")
+	}
+	if tcpRecoveryMode == "classic" {
+		log.Print("[TUNNEL] experimental classic TCP recovery enabled; RACK/TLP disabled")
 	}
 	if *exitProfiles != "" {
 		if !*exitNode || *client || *exitModeFlag != "proxy" || !*useSession {
@@ -270,6 +284,12 @@ func main() {
 		return
 	}
 
+	if *exitNode && exitMode == tunnel.ExitModeProxy {
+		closeProxy := startStandaloneProxy(trans, clientIP)
+		defer closeProxy()
+		log.Printf("Running as EXIT NODE (proxy mode)")
+		select {}
+	}
 	tun := tunnel.NewTCPTunnelWithClientIPMode(trans, *exitNode, clientIP, exitMode)
 
 	if *exitNode {
@@ -283,4 +303,26 @@ func main() {
 		socks5Server := socks5.NewSOCKS5Server(*socksAddr, tun)
 		log.Fatal(socks5Server.Start())
 	}
+}
+
+func startStandaloneProxy(trans transport.Transport, clientIP [4]byte) func() {
+	// Do not pace uploads on the document reader goroutine. The same reader
+	// must keep handling Session pongs and Engine.IO heartbeats under load.
+	// Reuse the bounded, per-session ingress path already used by exit groups.
+	proxy := tunnel.NewLazyProxy(trans, clientIP)
+	done := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				st := proxy.Snapshot()
+				log.Printf("[PAPERFLUX_PROXY] active=%t flows=%d queue_bytes=%d queue_drops=%d invalid_drops=%d session_resets=%d stale_drops=%d flow_rejected=%d", st.Active, st.Flows, st.QueueBytes, st.QueueDrops, st.InvalidDrops, st.SessionResets, st.StaleDrops, st.FlowRejected)
+			}
+		}
+	}()
+	return func() { close(done); proxy.Close() }
 }

@@ -18,6 +18,7 @@ import (
 
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/transport/control"
+	"universal-bypass-tool/transport/yandexhosts"
 	"universal-bypass-tool/utils"
 )
 
@@ -250,7 +251,20 @@ func (m *Manager) UseCookieStore(store *transport.CookieStore, name, key string)
 	m.cookieKeys[name] = key
 	m.mu.Unlock()
 	if jar := store.Load(key); len(jar) > 0 {
-		return m.ApplyCookiesFor(name, jar)
+		if err := m.ApplyCookiesFor(name, jar); err != nil {
+			return err
+		}
+	}
+	for _, root := range yandexhosts.Roots() {
+		if jar := store.Load(domainStoreKey(key, root)); len(jar) > 0 {
+			provider, _, err := m.cookieDomainProvider(name, root)
+			if err != nil {
+				return err
+			}
+			if err := provider.ApplyCookiesForDomain(root, jar); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -360,10 +374,10 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		}
 		// An unchanged response must not wake a carrier out of its normal
 		// reconnect backoff or rewrite the profile cookie store.
-		if current, err := m.FetchCookiesFor(name); err == nil && maps.Equal(current, cp.Jar) {
+		if current, err := m.fetchCookiesForDomain(name, cp.Domain); err == nil && maps.Equal(current, cp.Jar) {
 			return
 		}
-		if err := m.AcceptCookies(name, cp.Jar); err != nil {
+		if err := m.AcceptCookiesForDomain(name, cp.Domain, cp.Jar); err != nil {
 			utils.Debugf("[MANAGER] apply cookies (%s): %v", name, err)
 		}
 	}
@@ -397,6 +411,10 @@ func (m *Manager) RequestPeerCookies() error {
 // MatchingCookieCarrier confirms that a peer response was applied to the
 // intended document before the UI dismisses an outstanding auth prompt.
 func (m *Manager) MatchingCookieCarrier(name, doc string, jar map[string]string) string {
+	return m.MatchingCookieCarrierForDomain(name, doc, "", jar)
+}
+
+func (m *Manager) MatchingCookieCarrierForDomain(name, doc, domain string, jar map[string]string) string {
 	if len(jar) == 0 {
 		return ""
 	}
@@ -404,7 +422,7 @@ func (m *Manager) MatchingCookieCarrier(name, doc string, jar map[string]string)
 	if local == "" {
 		return ""
 	}
-	current, err := m.FetchCookiesFor(local)
+	current, err := m.fetchCookiesForDomain(local, domain)
 	if err != nil || !maps.Equal(current, jar) {
 		return ""
 	}
@@ -640,10 +658,21 @@ func (m *Manager) SetRemoteAuthNotifier(n CaptchaNotifier) {
 // OfferCookies sends a jar for one of the peer's transports (the answer to
 // an AuthRequired report).
 func (m *Manager) OfferCookies(name string, jar map[string]string) error {
+	return m.OfferCookiesForDomain(name, "", jar)
+}
+
+func (m *Manager) OfferCookiesForDomain(name, domain string, jar map[string]string) error {
+	if domain != "" {
+		root, ok := yandexhosts.Root(domain)
+		if !ok {
+			return fmt.Errorf("unsupported verification cookie domain")
+		}
+		domain = root
+	}
 	// name comes from the exit's AuthRequired request. It is the exit's
 	// name, not necessarily this side's entry; attaching a local document
 	// URL here could reroute the answer to a different exit carrier.
-	body, err := (&control.CookiesPayload{Transport: name, Jar: jar, Reason: "solved"}).Encode()
+	body, err := (&control.CookiesPayload{Transport: name, Domain: domain, Jar: jar, Reason: "solved"}).Encode()
 	if err != nil {
 		return err
 	}

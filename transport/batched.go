@@ -37,6 +37,10 @@ type BatchedTransport struct {
 	queue          chan []byte
 	queueByteLimit int64
 	queueBytes     atomic.Int64
+	queueSpace     chan struct{}
+	admitTimeout   time.Duration
+	queueWaits     atomic.Uint64
+	queueTimeouts  atomic.Uint64
 	lingerMs       int
 	maxBatchBytes  int
 	maxBatchCount  int
@@ -74,6 +78,8 @@ func newBatchedTransportWithBudget(inner Transport, budget int64) *BatchedTransp
 		Transport:      inner,
 		queue:          make(chan []byte, batchQueueDepth),
 		queueByteLimit: budget,
+		queueSpace:     make(chan struct{}),
+		admitTimeout:   time.Second,
 		lingerMs:       envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
 		maxBatchBytes:  min(envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes), maxFrameBytes-65537),
 		maxBatchCount:  min(envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount), maxFrameRecords-1),
@@ -105,14 +111,15 @@ func (b *BatchedTransport) Start() error {
 
 func (b *BatchedTransport) Stop() error {
 	b.lifecycle.Lock()
-	defer b.lifecycle.Unlock()
 	select {
 	case <-b.stopCh:
+		b.lifecycle.Unlock()
 		return nil
 	default:
 	}
 	b.running.Store(false)
 	b.stopOnce.Do(func() { close(b.stopCh) })
+	b.lifecycle.Unlock()
 	for {
 		select {
 		case p := <-b.queue:
@@ -124,30 +131,57 @@ func (b *BatchedTransport) Stop() error {
 }
 
 // Send copies the packet (the caller's buffer may be reused) and enqueues it
-// for batching. A full queue returns an explicit error; TCP may retransmit,
-// while UDP callers must treat it as datagram loss.
+// for batching. Wait only for a bounded interval, without holding lifecycle:
+// Stop must release producers even when the carrier has stopped draining.
 func (b *BatchedTransport) Send(data []byte) error {
-	b.lifecycle.Lock()
-	defer b.lifecycle.Unlock()
-	if !b.running.Load() {
-		return fmt.Errorf("batched transport is not running")
-	}
 	if len(data) > 65535 {
 		return fmt.Errorf("packet too large for batch record: %d bytes", len(data))
 	}
-	if b.queueBytes.Load()+int64(len(data)) > b.queueByteLimit {
-		return fmt.Errorf("batch byte budget full")
+	if int64(len(data)) > b.queueByteLimit {
+		return fmt.Errorf("packet exceeds batch byte budget")
 	}
-	p := make([]byte, len(data))
-	copy(p, data)
-	b.queueBytes.Add(int64(len(p)))
-	select {
-	case b.queue <- p:
-		return nil
-	default:
-		b.queueBytes.Add(-int64(len(p)))
-		return fmt.Errorf("batch queue full")
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		b.lifecycle.Lock()
+		if !b.running.Load() {
+			b.lifecycle.Unlock()
+			return fmt.Errorf("batched transport is not running")
+		}
+		if len(b.queue) < cap(b.queue) && b.queueBytes.Load()+int64(len(data)) <= b.queueByteLimit {
+			p := append([]byte(nil), data...)
+			b.queueBytes.Add(int64(len(p)))
+			b.queue <- p
+			b.lifecycle.Unlock()
+			return nil
+		}
+		space := b.queueSpace
+		b.lifecycle.Unlock()
+		if timer == nil {
+			b.queueWaits.Add(1)
+			timer = time.NewTimer(b.admitTimeout)
+		}
+		select {
+		case <-b.stopCh:
+			return fmt.Errorf("batched transport is stopped")
+		case <-timer.C:
+			b.queueTimeouts.Add(1)
+			return fmt.Errorf("batch admission timed out")
+		case <-space:
+		}
 	}
+}
+
+func (b *BatchedTransport) releaseQueuePacket(p []byte) {
+	b.queueBytes.Add(-int64(len(p)))
+	b.lifecycle.Lock()
+	close(b.queueSpace)
+	b.queueSpace = make(chan struct{})
+	b.lifecycle.Unlock()
 }
 
 func (b *BatchedTransport) Receive(callback func([]byte)) {
@@ -182,6 +216,9 @@ func (b *BatchedTransport) Stats() TransportStats {
 	st.ExpiredDrops += b.expired.Load()
 	st.QueuePackets += uint64(len(b.queue))
 	st.WriteFailures += b.sendErrors.Load()
+	st.QueueWaits += b.queueWaits.Load()
+	st.QueueTimeouts += b.queueTimeouts.Load()
+	st.QueueBytes += uint64(max(int64(0), b.queueBytes.Load()))
 	return st
 }
 
@@ -197,7 +234,7 @@ func (b *BatchedTransport) flushLoop() {
 		case <-b.stopCh:
 			return
 		case first = <-b.queue:
-			b.queueBytes.Add(-int64(len(first)))
+			b.releaseQueuePacket(first)
 		}
 		batch := [][]byte{first}
 		size := 2 + len(first)
@@ -208,7 +245,7 @@ func (b *BatchedTransport) flushLoop() {
 		for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			select {
 			case p := <-b.queue:
-				b.queueBytes.Add(-int64(len(p)))
+				b.releaseQueuePacket(p)
 				batch = append(batch, p)
 				size += 2 + len(p)
 			default:
@@ -228,7 +265,7 @@ func (b *BatchedTransport) flushLoop() {
 					timer.Stop()
 					return
 				case p := <-b.queue:
-					b.queueBytes.Add(-int64(len(p)))
+					b.releaseQueuePacket(p)
 					batch = append(batch, p)
 					size += 2 + len(p)
 				case <-timer.C:

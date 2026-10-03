@@ -41,6 +41,11 @@ func TestCaptchaRetryOnce(t *testing.T) {
 }
 
 func TestAuthRejectsForeignHostsAndStops(t *testing.T) {
+	for _, raw := range []string{"https://docs.yandex.kz/", "https://disk.yandex.by/", "https://docs.yandex.com.tr/"} {
+		if _, err := captchaRequest(context.Background(), "GET", raw, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, raw := range []string{"http://docs.yandex.ru/", "https://docs.yandex.ru.evil.invalid/", "https://user:pass@docs.yandex.ru/", "https://127.0.0.1/", "https://docs.yandex.ru:8443/"} {
 		if _, err := captchaRequest(context.Background(), "GET", raw, nil); err == nil {
 			t.Fatal("unsafe endpoint accepted")

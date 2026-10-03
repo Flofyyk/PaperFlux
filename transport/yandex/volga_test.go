@@ -28,7 +28,7 @@ func TestVolgaRelayAuthorizationExpiry(t *testing.T) {
 			if (err == nil) != success {
 				t.Fatalf("unexpected result: %v", err)
 			}
-			if r.authExpired.Load() != (status == 401 || status == 403) {
+			if r.auth.expired.Load() != (status == 401 || status == 403) {
 				t.Fatal("incorrect reauthorization signal")
 			}
 			if (r.stats.BytesSent.Load() > 0) != success {

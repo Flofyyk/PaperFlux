@@ -6,7 +6,7 @@
 
 ## Сборка
 
-Готовые бинарники `PaperFlux-Profile-Service-v0.5.7-linux-amd64` и `PaperFlux-Profile-Service-v0.5.7-linux-arm64` доступны в серверном релизе. Выберите архитектуру VPS и установите выбранный файл как `/usr/local/bin/paperflux-profile-service`. Сборка из исходников описана ниже.
+Готовые бинарники сервиса выдачи профилей для Linux `amd64` и `arm64` доступны в [серверных релизах](https://github.com/Flofyyk/PaperFlux/releases/latest). Выберите архитектуру VPS и установите выбранный файл как `/usr/local/bin/paperflux-profile-service`. Сборка из исходников описана ниже.
 
 Из корня серверного репозитория:
 

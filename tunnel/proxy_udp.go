@@ -51,6 +51,7 @@ func (t *TCPTunnel) handleProxyUDP(request *udp.ForwarderRequest) bool {
 	select {
 	case t.proxyFlows <- struct{}{}:
 	default:
+		t.proxyFlowRejected.Add(1)
 		return false
 	}
 	var queue waiter.Queue

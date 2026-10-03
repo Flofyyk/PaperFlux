@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"universal-bypass-tool/transport/yandexhosts"
 )
 
 const maxAuthHTML = 2 << 20
@@ -32,7 +33,7 @@ func safeAuthError(err error) error {
 func captchaRequest(ctx context.Context, method, rawURL string, body io.Reader) (*http.Request, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" ||
-		(u.Hostname() != "disk.yandex.ru" && u.Hostname() != "docs.yandex.ru") {
+		!yandexhosts.DocumentHost(u.Hostname()) {
 		return nil, fmt.Errorf("unsupported Yandex authentication endpoint")
 	}
 	return http.NewRequestWithContext(ctx, method, u.String(), body)
@@ -126,7 +127,7 @@ func fetchAuthPage(ctx context.Context, original string, client *http.Client, so
 			if err != nil {
 				return nil, nil, fmt.Errorf("invalid document redirect")
 			}
-			if u.Hostname() == "passport.yandex.ru" || u.Hostname() == "passport.yandex.com" {
+			if _, trusted := yandexhosts.Root(u.Hostname()); trusted && strings.HasPrefix(u.Hostname(), "passport.") {
 				return nil, nil, errLoginRequired
 			}
 			if strings.Contains(u.Path, "showcaptcha") {

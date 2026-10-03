@@ -10,12 +10,12 @@ import (
 )
 
 func TestAllowedTargets(t *testing.T) {
-	for _, a := range []string{"disk.yandex.ru:443", "smartcaptcha.yandexcloud.net:443", "yastatic.net:443"} {
+	for _, a := range []string{"disk.yandex.ru:443", "docs.yandex.kz:443", "passport.yandex.by:443", "docs.yandex.uz:443", "docs.yandex.com.tr:443", "smartcaptcha.yandexcloud.net:443", "yastatic.net:443"} {
 		if !AllowedAddress(a) {
 			t.Fatal(a)
 		}
 	}
-	for _, a := range []string{"127.0.0.1:443", "169.254.169.254:443", "disk.yandex.ru:80", "disk.yandex.ru.evil.org:443", "example.com:443", "[::1]:443"} {
+	for _, a := range []string{"127.0.0.1:443", "169.254.169.254:443", "disk.yandex.ru:80", "disk.yandex.ru.evil.org:443", "docs.yandex.kz.evil.org:443", "example.com:443", "[::1]:443"} {
 		if AllowedAddress(a) {
 			t.Fatal(a)
 		}

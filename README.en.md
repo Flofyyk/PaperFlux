@@ -10,6 +10,7 @@ PaperFlux VPN tunnel server with Yandex Docs and Mail.ru Docs transports. Receiv
 - Two Yandex Docs channels and an optional Volga fallback channel.
 - Automatic reconnection and DNS/TCP readiness checks.
 - Bounded queues, traffic rate limits and active-flow limits.
+- Exit readiness confirmation before data transmission and a 4096-packet replay window.
 - Rootless IPv4 TCP/UDP forwarding in `proxy` mode and Linux packet forwarding in `raw` mode.
 - Experimental grouped proxy for independent profiles sharing one process.
 
@@ -48,6 +49,8 @@ Single-profile example:
 Replace the example document URL and key. Both endpoints must use matching IDs, keys, virtual IPs and transport settings.
 
 The [deployment guide](docs/DEPLOYMENT.md) covers service users, systemd and upgrades. `raw` mode requires root and additional Linux configuration. IPv6 is not supported. Legacy PFS2 is not compatible with Session.
+
+TCP recovery, buffers and proxy ingress queue settings are documented in the [transport guide](docs/TRANSPORTS.md#экспериментальный-tcp-recovery). DNS/TCP probes have a separate small connection pool that ordinary application traffic cannot occupy.
 
 ## Documentation
 

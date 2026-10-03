@@ -38,12 +38,13 @@ type Session struct {
 	remote           PeerParameters
 	exit             bool
 	ready            bool
+	peerConfirmed    bool // client: exit accepted this challenge, not just echoed it
 	started          bool
 	stopped          bool
 	sequence         uint64
 	dataEpoch        uint64
 	highest          uint64
-	window           uint64
+	window           replayWindow
 	handshakeTimeout time.Duration
 	handshakePaused  func() bool
 
@@ -78,9 +79,10 @@ type Session struct {
 	epochCallback   func(uint64, []byte)
 	controlCallback ControlHandler
 
-	done chan struct{}
-	once sync.Once
-	wg   sync.WaitGroup
+	done     chan struct{}
+	once     sync.Once
+	wg       sync.WaitGroup
+	selector laneSelector
 }
 
 // candidatePeer is an unknown sender offered a fresh challenge while the
@@ -352,7 +354,7 @@ func (s *Session) helloLoop() {
 	defer tick.Stop()
 	for {
 		s.mu.Lock()
-		ready := s.ready
+		ready := s.establishedLocked()
 		var names []string
 		if !ready {
 			for _, name := range s.order {
@@ -451,9 +453,10 @@ func (s *Session) peerSilentLocked() bool {
 // the handshake. Caller holds s.mu.
 func (s *Session) resetLocked() {
 	s.ready = false
+	s.peerConfirmed = false
 	s.peer = [32]byte{}
 	s.remote = PeerParameters{}
-	s.sequence, s.highest, s.window = 0, 0, 0
+	s.sequence, s.highest, s.window = 0, 0, replayWindow{}
 	s.peerKeepalive = false
 	s.candidate = nil
 	if _, err := rand.Read(s.local[:]); err != nil {
@@ -528,7 +531,7 @@ func (s *Session) Stop() error {
 // at least one transport is live.
 func (s *Session) IsConnected() bool {
 	s.mu.Lock()
-	ready := s.ready && !s.stopped
+	ready := s.establishedLocked() && !s.stopped
 	s.mu.Unlock()
 	if !ready {
 		return false
@@ -560,7 +563,7 @@ func (s *Session) liveLocked(l *transportLink) bool {
 func (s *Session) ActiveTransport() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.ready || s.stopped {
+	if !s.establishedLocked() || s.stopped {
 		return ""
 	}
 	if links := s.liveLinksLocked(); len(links) > 0 {
@@ -576,7 +579,14 @@ func (s *Session) IsExit() bool { return s.exit }
 func (s *Session) PeerParameters() (PeerParameters, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.remote, s.ready && !s.stopped
+	return s.remote, s.establishedLocked() && !s.stopped
+}
+
+// A challenge echo proves identity; only Ready=1 proves the exit accepted
+// it. Keep sending Ready=0 hellos until confirmation so a lost final reply
+// does not strand a client behind an already-established exit.
+func (s *Session) establishedLocked() bool {
+	return s.ready && (s.exit || s.peerConfirmed)
 }
 
 // Transports returns the list of transport names currently attached,
@@ -629,7 +639,7 @@ func (s *Session) buildHello() *control.Envelope {
 			MaxPacketSize: uint16(s.params.MaxPacketSize),
 		},
 	}
-	if s.ready {
+	if s.establishedLocked() {
 		env.Hello.Ready = 1
 	}
 	return env
@@ -673,7 +683,7 @@ func (s *Session) sendIPv4(epoch uint64, p []byte) error {
 		s.mu.Unlock()
 		return errors.New("obsolete data epoch")
 	}
-	if !s.ready || s.stopped {
+	if !s.establishedLocked() || s.stopped {
 		s.mu.Unlock()
 		return ErrNegotiationPending
 	}
@@ -707,19 +717,53 @@ func (s *Session) sendIPv4(epoch uint64, p []byte) error {
 	}
 	raw = append(raw, p...)
 
-	// Priority is the failover order: use the best live carrier, and
-	// spread flows only across carriers sharing that priority. The flow
-	// hash keeps each 4-tuple on one carrier so its ordering is preserved.
-	top := links[:1]
-	for _, l := range links[1:] {
-		if l.priority != links[0].priority {
-			break
-		}
-		top = append(top, l)
+	// New flows prefer the highest healthy priority. A flow that already
+	// failed over remains on its working carrier instead of waiting on
+	// the same congested primary again for every packet.
+	flow := extractFlowKeyBytes(p)
+	key := string(flow[:])
+	candidates := s.laneCandidates(links)
+	idx := s.selector.pick(candidates, key, 0, time.Now())
+	if idx < 0 {
+		return errors.New("session: no live transport")
 	}
-	key := extractFlowKeyBytes(p)
-	idx := int(flowHashBytes(key) % uint64(len(top)))
-	return top[idx].batched.Send(raw)
+	err = links[idx].batched.Send(raw)
+	s.selector.noteResult(links[idx].name, err)
+	if err == nil {
+		return nil
+	}
+	// Admission failure means the packet was not accepted. Retry its exact
+	// sequence on another live channel; receive deduplication remains global.
+	s.selector.forgetFlow(key)
+	for _, link := range links {
+		if link == links[idx] {
+			continue
+		}
+		retryErr := link.batched.Send(raw)
+		s.selector.noteResult(link.name, retryErr)
+		if retryErr == nil {
+			s.selector.rememberFlow(key, link.name)
+			return nil
+		}
+	}
+	return err
+}
+
+func (s *Session) laneCandidates(links []*transportLink) []laneCandidate {
+	out := make([]laneCandidate, 0, len(links))
+	for _, l := range links {
+		health := laneHealth(l.raw)
+		s.mu.Lock()
+		if l.rtt > 0 {
+			health.RTT = l.rtt
+		}
+		s.mu.Unlock()
+		st := l.batched.Stats()
+		health.QueueLoad = max(health.QueueLoad, float64(len(l.batched.queue))/float64(cap(l.batched.queue)))
+		health.WriteFailures = st.WriteFailures
+		out = append(out, laneCandidate{name: l.name, health: health, stats: st, priority: l.priority})
+	}
+	return out
 }
 
 // liveLinksLocked returns the live transports in priority order.
@@ -743,7 +787,15 @@ func (s *Session) SendControl(subtype control.Subtype, payload []byte) error {
 	if len(links) == 0 {
 		return errors.New("session: no live transport for control")
 	}
-	return s.sendControlVia(links[0], subtype, payload)
+	var firstErr error
+	for _, link := range links {
+		if err := s.sendControlVia(link, subtype, payload); err == nil {
+			return nil
+		} else if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // sendControlVia transmits a control packet through one specific carrier.
@@ -755,7 +807,7 @@ func (s *Session) sendControlVia(link *transportLink, subtype control.Subtype, p
 		return fmt.Errorf("session: control payload too large (%d bytes)", len(payload))
 	}
 	s.mu.Lock()
-	if !s.ready || s.stopped {
+	if !s.establishedLocked() || s.stopped {
 		s.mu.Unlock()
 		return ErrNegotiationPending
 	}
@@ -883,6 +935,9 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 			MaxPacketSize: minInt(params.MaxPacketSize, s.params.MaxPacketSize),
 		}
 		s.ready = true
+		if env.Hello.Ready == 1 {
+			s.peerConfirmed = true
+		}
 	}
 	link.lastHeard = time.Now()
 	// Reply through every live transport so the peer sees the new ready
@@ -918,11 +973,12 @@ func (s *Session) offerReplacementLocked(link *transportLink, sender [32]byte, p
 		s.dataEpoch++
 		s.local = cand.local
 		s.peer = sender
+		s.peerConfirmed = env.Hello.Ready == 1
 		s.remote = PeerParameters{
 			Capabilities:  params.Capabilities & s.params.Capabilities,
 			MaxPacketSize: minInt(params.MaxPacketSize, s.params.MaxPacketSize),
 		}
-		s.sequence, s.highest, s.window = 0, 0, 0
+		s.sequence, s.highest, s.window = 0, 0, replayWindow{}
 		s.peerKeepalive = false
 		s.candidate = nil
 		for _, l := range s.links {
@@ -930,18 +986,21 @@ func (s *Session) offerReplacementLocked(link *transportLink, sender [32]byte, p
 		}
 		link.lastHeard = now
 		names := append([]string(nil), s.order...)
+		epoch := s.dataEpoch
 		s.mu.Unlock()
 		utils.Debugf("[SESSION] peer replaced after a fresh challenge")
+		utils.Infof("[PAPERFLUX_SESSION] peer_replaced epoch=%d exit=%t", epoch, s.exit)
 		for _, name := range names {
 			_ = s.helloVia(name)
 		}
 		return
 	}
 
-	// A discovery reply from a restarted exit addresses our still-current
-	// identity. It may request a candidate challenge, never adopt a peer by
-	// itself. An echo of that freshly minted challenge is still mandatory.
-	if env.Peer != ([32]byte{}) && env.Peer != s.local {
+	// Match upstream: only zero-address discovery can begin replacement.
+	// A nonzero addressed hello is accepted only by the exact candidate-echo
+	// branch above. Otherwise crossed/stale offers can spawn more offers and
+	// continuously rotate identities, tearing down every live proxy flow.
+	if env.Peer != ([32]byte{}) {
 		s.mu.Unlock()
 		return
 	}
@@ -990,7 +1049,7 @@ func (s *Session) receiveIPv4(link *transportLink, p []byte, env *control.Envelo
 		return
 	}
 	s.mu.Lock()
-	if env.Data == nil || !s.ready || s.stopped || env.Local != s.peer || env.Peer != s.local {
+	if env.Data == nil || !s.establishedLocked() || s.stopped || env.Local != s.peer || env.Peer != s.local {
 		s.mu.Unlock()
 		return
 	}
@@ -1019,7 +1078,7 @@ func (s *Session) receiveControl(link *transportLink, p []byte, env *control.Env
 		return
 	}
 	s.mu.Lock()
-	if !s.ready || s.stopped || env.Local != s.peer || env.Peer != s.local {
+	if !s.establishedLocked() || s.stopped || env.Local != s.peer || env.Peer != s.local {
 		s.mu.Unlock()
 		return
 	}
@@ -1053,28 +1112,47 @@ func (s *Session) receiveControl(link *transportLink, p []byte, env *control.Env
 	go cb(env.Control.Subtype, payload)
 }
 
-// acceptSequenceLocked implements the 64-entry sliding replay window.
+const replayWindowSize = 4096
+
+type replayWindow [replayWindowSize / 64]uint64
+
+func (w *replayWindow) has(seq uint64) bool {
+	i := seq % replayWindowSize
+	return w[i/64]&(uint64(1)<<(i%64)) != 0
+}
+func (w *replayWindow) set(seq uint64) {
+	i := seq % replayWindowSize
+	w[i/64] |= uint64(1) << (i % 64)
+}
+func (w *replayWindow) clear(seq uint64) {
+	i := seq % replayWindowSize
+	w[i/64] &^= uint64(1) << (i % 64)
+}
+
+// acceptSequenceLocked accepts out-of-order packets once within a bounded
+// window shared by all carriers. The packet format and session keys are unchanged.
 // Caller holds s.mu.
 func (s *Session) acceptSequenceLocked(seq uint64) bool {
 	if seq == 0 {
 		return false
 	}
 	if seq > s.highest {
-		gap := seq - s.highest
-		if gap >= 64 {
-			s.window = 0
+		if seq-s.highest >= replayWindowSize {
+			s.window = replayWindow{}
 		} else {
-			s.window <<= gap
+			for n := s.highest + 1; n < seq; n++ {
+				s.window.clear(n)
+			}
 		}
 		s.highest = seq
-		s.window |= 1
+		s.window.clear(seq)
+		s.window.set(seq)
 		return true
 	}
-	gap := s.highest - seq
-	if gap >= 64 || s.window&(uint64(1)<<gap) != 0 {
+	if s.highest-seq >= replayWindowSize || s.window.has(seq) {
 		return false
 	}
-	s.window |= uint64(1) << gap
+	s.window.set(seq)
 	return true
 }
 
@@ -1099,6 +1177,9 @@ func (s *Session) Stats() TransportStats {
 		out.ExpiredDrops += st.ExpiredDrops
 		out.QueuePackets += st.QueuePackets
 		out.WriteFailures += st.WriteFailures
+		out.QueueBytes += st.QueueBytes
+		out.QueueWaits += st.QueueWaits
+		out.QueueTimeouts += st.QueueTimeouts
 	}
 	out.Connected = s.IsConnected()
 	return out

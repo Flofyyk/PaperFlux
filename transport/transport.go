@@ -43,6 +43,8 @@ type TransportStats struct {
 	QueuePackets  uint64
 	QueueBytes    uint64
 	WriteFailures uint64
+	QueueWaits    uint64
+	QueueTimeouts uint64
 	Connected     bool
 	Uptime        time.Duration
 }

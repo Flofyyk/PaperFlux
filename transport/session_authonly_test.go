@@ -60,6 +60,7 @@ func TestDocumentMustHaveItsOwnPeerProof(t *testing.T) {
 	a, _, _, _ := sessionPair(t)
 	a.mu.Lock()
 	a.ready = true
+	a.peerConfirmed = true // this test isolates per-document proof after handshake
 	lane := a.links["primary"]
 	lane.started = true
 	a.mu.Unlock()

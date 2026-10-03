@@ -3,6 +3,8 @@ package tunnel
 import (
 	"encoding/binary"
 	"errors"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,7 @@ type LazyProxy struct {
 	stopped       chan struct{}
 	closed        bool
 	queuedBytes   int
+	queueLimit    int
 	dropped       atomic.Uint64
 	invalidDrops  atomic.Uint64
 	queueDrops    atomic.Uint64
@@ -66,8 +69,18 @@ func (t *lazyStackTransport) Send(data []byte) error {
 
 const lazyQueueBytes = 256 << 10
 
+func proxyQueueBound(name string, fallback, min, max int) int {
+	value, err := strconv.Atoi(os.Getenv(name))
+	if err != nil || value < min || value > max {
+		return fallback
+	}
+	return value
+}
+
 func NewLazyProxy(upstream transport.Transport, ip [4]byte) *LazyProxy {
-	p := &LazyProxy{upstream: upstream, ip: ip, queue: make(chan sessionPacket, 128), done: make(chan struct{}), stopped: make(chan struct{})}
+	packets := proxyQueueBound("PAPERFLUX_PROXY_QUEUE_PACKETS", 128, 128, 1024)
+	bytes := proxyQueueBound("PAPERFLUX_PROXY_QUEUE_KIB", 256, 256, 2048) << 10
+	p := &LazyProxy{upstream: upstream, ip: ip, queue: make(chan sessionPacket, packets), queueLimit: bytes, done: make(chan struct{}), stopped: make(chan struct{})}
 	p.lastActive.Store(time.Now().UnixNano())
 	if sessions, ok := upstream.(transport.SessionPackets); ok {
 		p.sessions = sessions
@@ -101,7 +114,7 @@ func (p *LazyProxy) enqueueSession(epoch uint64, data []byte) {
 		return
 	}
 	p.latestEpoch.Store(epoch)
-	if p.queuedBytes+len(data) > lazyQueueBytes || len(p.queue) == cap(p.queue) {
+	if p.queuedBytes+len(data) > p.queueLimit || len(p.queue) == cap(p.queue) {
 		p.dropped.Add(1)
 		p.queueDrops.Add(1)
 		return
@@ -194,6 +207,7 @@ func (p *LazyProxy) Close() {
 type LazyProxyStats struct {
 	Active        bool   `json:"active"`
 	Flows         int    `json:"flows"`
+	FlowRejected  uint64 `json:"flowRejected"`
 	QueueBytes    int    `json:"queueBytes"`
 	Dropped       uint64 `json:"dropped"`
 	InvalidDrops  uint64 `json:"invalidDrops,omitempty"`
@@ -210,6 +224,7 @@ func (p *LazyProxy) Snapshot() LazyProxyStats {
 	result.SessionResets, result.StaleDrops = p.sessionResets.Load(), p.staleDrops.Load()
 	if p.stack != nil {
 		result.Flows = p.stack.ActiveFlows()
+		result.FlowRejected = p.stack.proxyFlowRejected.Load()
 	}
 	p.gate.Lock()
 	result.QueueBytes = p.queuedBytes

@@ -48,7 +48,7 @@ func (s *Session) dataLinksLocked() []*transportLink {
 func (s *Session) HasDataPath() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ready && !s.stopped && len(s.dataLinksLocked()) > 0
+	return s.establishedLocked() && !s.stopped && len(s.dataLinksLocked()) > 0
 }
 
 func (s *Session) DataRTT() time.Duration {

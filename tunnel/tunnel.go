@@ -67,6 +67,8 @@ type TCPTunnel struct {
 	outboundDrop       atomic.Uint64
 	outboundErr        atomic.Uint64
 	proxyFlows         chan struct{}
+	proxyProbeFlows    chan struct{}
+	proxyFlowRejected  atomic.Uint64
 	downloadLimiter    *rate.Limiter
 	proxyUploadLimiter *rate.Limiter
 	lifecycleContext   context.Context
@@ -111,19 +113,17 @@ func NewTCPTunnelWithClientIPMode(trans transport.Transport, isExitNode bool, cl
 		// external proxy or a direct-network fallback.
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-
-	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-		&tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-		utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
+	if err := configureTCPRecovery(t.gvisorStack, tcpRecoveryEnvironment()); err != nil {
+		utils.Infof("[TUNNEL] TCP recovery configuration rejected; keeping stack default: %v", err)
 	}
-	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-		&tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-		utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
+
+	if err := configureTCPBuffers(t.gvisorStack); err != nil {
+		utils.Infof("[TUNNEL] TCP buffer configuration rejected: %v", err)
 	}
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
-		if isExitNode && exitMode == ExitModeProxy && t.downloadLimiter != nil {
+		if isExitNode && exitMode == ExitModeProxy && t.downloadLimiter != nil && pacedPacketBytes(data) > 0 {
 			if err := t.downloadLimiter.WaitN(t.lifecycleContext, len(data)); err != nil {
 				return
 			}
@@ -167,7 +167,7 @@ func NewTCPTunnelWithClientIPMode(trans transport.Transport, isExitNode bool, cl
 		if t.lifecycleContext.Err() != nil {
 			return
 		}
-		if t.proxyUploadLimiter != nil {
+		if t.proxyUploadLimiter != nil && pacedPacketBytes(data) > 0 {
 			if err := t.proxyUploadLimiter.WaitN(t.lifecycleContext, len(data)); err != nil {
 				return
 			}
@@ -251,7 +251,8 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 	t.gvisorStack.SetSpoofing(tunnelNIC, true)
 	t.gvisorStack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: tunnelNIC})
 	t.proxyFlows = make(chan struct{}, maxProxyFlows)
-	fwd := tcp.NewForwarder(t.gvisorStack, 0, maxProxyFlows, t.handleProxyTCP)
+	t.proxyProbeFlows = make(chan struct{}, 4)
+	fwd := tcp.NewForwarder(t.gvisorStack, 0, maxProxyFlows+cap(t.proxyProbeFlows), t.handleProxyTCP)
 	t.gvisorStack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 	// This callback creates the endpoint synchronously. Do not clone pkt:
 	// this gVisor revision's UDP Forwarder clones it without releasing it.
@@ -269,9 +270,17 @@ func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 	// JoinHostPort preserves IPv6 bracket syntax. Formatting the pair manually
 	// works for IPv4 but produces an ambiguous address for IPv6 destinations.
 	destination := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	// End-to-end DNS/TCP health checks must survive a full application pool.
+	// Reserve a small separate budget only for the two existing probe targets;
+	// other destinations and UDP cannot consume these slots.
+	flows := t.proxyFlows
+	if id.LocalPort == 53 && (id.LocalAddress.String() == "77.88.8.8" || id.LocalAddress.String() == "77.88.8.1") {
+		flows = t.proxyProbeFlows
+	}
 	select {
-	case t.proxyFlows <- struct{}{}:
+	case flows <- struct{}{}:
 	default:
+		t.proxyFlowRejected.Add(1)
 		utils.Debugf("[EXIT] proxy flow limit reached for %s", destination)
 		request.Complete(true)
 		return
@@ -280,7 +289,7 @@ func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 	var waitQueue waiter.Queue
 	endpoint, tcpErr := request.CreateEndpoint(&waitQueue)
 	if tcpErr != nil {
-		<-t.proxyFlows
+		<-flows
 		utils.Debugf("[EXIT] CreateEndpoint %s: %v", destination, tcpErr)
 		request.Complete(true)
 		return
@@ -288,7 +297,7 @@ func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 	request.Complete(false)
 	local := gonet.NewTCPConn(&waitQueue, endpoint)
 	if !t.trackConnection(local) {
-		<-t.proxyFlows
+		<-flows
 		return
 	}
 	go func() {
@@ -297,7 +306,7 @@ func (t *TCPTunnel) handleProxyTCP(request *tcp.ForwarderRequest) {
 				utils.Debugf("[EXIT] proxy flow panic for %s: %v", destination, recovered)
 			}
 		}()
-		defer func() { <-t.proxyFlows }()
+		defer func() { <-flows }()
 		defer t.releaseConnection(local)
 		dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 		remote, err := dialer.DialContext(t.lifecycleContext, "tcp", destination)

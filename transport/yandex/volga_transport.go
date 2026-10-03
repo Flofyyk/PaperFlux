@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/yandexhosts"
 )
 
 // Volga writes operations to the shared document. It is an explicit provider,
@@ -77,14 +78,14 @@ func (t *YandexVolgaTransport) Stop() error {
 func (t *YandexVolgaTransport) IsConnected() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.IsRunning() && t.ws != nil && t.ws.connected.Load() && t.relay != nil && !t.relay.authExpired.Load()
+	return t.IsRunning() && t.ws != nil && t.ws.connected.Load() && t.relay != nil && !t.relay.auth.expired.Load()
 }
 
 func (t *YandexVolgaTransport) Send(data []byte) error {
 	t.mu.Lock()
 	r, w := t.relay, t.ws
 	t.mu.Unlock()
-	if t.ctx.Err() != nil || r == nil || w == nil || !w.connected.Load() || r.authExpired.Load() {
+	if t.ctx.Err() != nil || r == nil || w == nil || !w.connected.Load() || r.auth.expired.Load() {
 		return fmt.Errorf("Volga channel not ready")
 	}
 	return r.Send(data)
@@ -99,7 +100,19 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
 	s.PacketsRecv = t.stats.PacketsRecv.Load()
 	s.WriteFailures = t.stats.HTTPReqsFailed.Load()
 	s.ExpiredDrops = t.stats.QueueDrops.Load()
+	s.RetryQueued = t.stats.RetryQueued.Load()
+	s.QueuePackets = uint64(max(int64(0), t.stats.QueuedPackets.Load()))
+	s.QueueBytes = uint64(max(int64(0), t.stats.QueuedBytes.Load()))
+	s.QueueWaits = t.stats.QueueWaits.Load()
+	s.QueueTimeouts = t.stats.QueueTimeouts.Load()
 	return s
+}
+
+func (t *YandexVolgaTransport) QueueLoad() float64 {
+	return min(1, float64(t.stats.QueuedPackets.Load())/float64(max(1, t.config.QueueSize)))
+}
+func (t *YandexVolgaTransport) LaneHealth() transport.LaneHealth {
+	return transport.LaneHealth{Connected: t.IsConnected(), QueueLoad: t.QueueLoad(), WriteFailures: t.stats.HTTPReqsFailed.Load()}
 }
 
 func (t *YandexVolgaTransport) supervise() {
@@ -112,6 +125,20 @@ func (t *YandexVolgaTransport) supervise() {
 		if err == nil && t.ctx.Err() == nil {
 			r := newRelayClient(auth, t.config, t.stats)
 			w := newWSListener(auth, t.config, t.stats, r, t.CallReceive)
+			w.authorizeFn = func(parent context.Context) (*volgaAuth, error) {
+				ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+				defer cancel()
+				fresh, err := authorizeWithJar(ctx, t.docURL, jar)
+				if errors.Is(err, errCaptchaChallenge) || errors.Is(err, errLoginRequired) {
+					t.mu.Lock()
+					notify := t.notifier
+					t.mu.Unlock()
+					if notify != nil && parent.Err() == nil {
+						notify(err, "vyandex", t.docURL, AuthReason(err))
+					}
+				}
+				return fresh, err
+			}
 			t.mu.Lock()
 			if t.stopped {
 				t.mu.Unlock()
@@ -125,6 +152,9 @@ func (t *YandexVolgaTransport) supervise() {
 			t.mu.Unlock()
 			log.Printf("[PAPERFLUX] Volga authorized; waiting for protected peer")
 			started, missing := time.Now(), time.Now()
+			var detector stalledTraffic
+			lastData, lastReceived := t.stats.DataQueued.Load(), t.stats.DataReceived.Load()
+			lastObserve := time.Now()
 			tick := time.NewTicker(time.Second)
 		wait:
 			for {
@@ -138,8 +168,16 @@ func (t *YandexVolgaTransport) supervise() {
 				if w.connected.Load() {
 					missing = time.Now()
 				}
-				if r.authExpired.Load() || time.Since(missing) > 30*time.Second || time.Since(started) > 45*time.Minute {
-					break
+				if r.auth.expired.Load() || time.Since(missing) > 30*time.Second {
+					w.RequestReconnect()
+					missing = time.Now()
+				}
+				if time.Since(lastObserve) >= 5*time.Second {
+					data, received := t.stats.DataQueued.Load(), t.stats.DataReceived.Load()
+					if detector.Observe(data-lastData, received-lastReceived) {
+						w.RequestReconnect()
+					}
+					lastData, lastReceived, lastObserve = data, received, time.Now()
 				}
 			}
 			tick.Stop()
@@ -206,13 +244,32 @@ func (t *YandexVolgaTransport) FetchCookies() (map[string]string, error) {
 	return out, nil
 }
 func (t *YandexVolgaTransport) ApplyCookies(values map[string]string) error {
-	u, _ := url.Parse("https://disk.yandex.ru/")
+	return t.ApplyCookiesForDomain("yandex.ru", values)
+}
+func (t *YandexVolgaTransport) FetchCookiesForDomain(domain string) (map[string]string, error) {
+	root, ok := yandexhosts.Root(domain)
+	if !ok {
+		return nil, fmt.Errorf("unsupported verification cookie domain")
+	}
+	u, _ := url.Parse("https://" + root + "/")
+	out := map[string]string{}
+	for _, c := range t.jar.Cookies(u) {
+		out[c.Name] = c.Value
+	}
+	return out, nil
+}
+func (t *YandexVolgaTransport) ApplyCookiesForDomain(domain string, values map[string]string) error {
+	root, ok := yandexhosts.Root(domain)
+	if !ok {
+		return fmt.Errorf("unsupported verification cookie domain")
+	}
+	u, _ := url.Parse("https://" + root + "/")
 	cookies := make([]*http.Cookie, 0, len(values))
 	if len(values) > 128 {
 		return fmt.Errorf("too many verification cookies")
 	}
 	for n, v := range values {
-		c := &http.Cookie{Name: n, Value: v, Domain: ".yandex.ru", Path: "/", Secure: true}
+		c := &http.Cookie{Name: n, Value: v, Domain: "." + root, Path: "/", Secure: true}
 		if c.Valid() != nil || len(v) > 8192 {
 			return fmt.Errorf("invalid verification cookie")
 		}

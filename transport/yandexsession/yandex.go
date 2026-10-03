@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"universal-bypass-tool/transport/yandexhosts"
 
 	"github.com/gorilla/websocket"
 
@@ -81,8 +82,10 @@ type YandexDocsTransport struct {
 	laneID    uint32
 	queue     chan []byte
 
-	userCounter atomic.Int32
-	baseUserID  string
+	userCounter   atomic.Int32
+	writeFailures atomic.Uint64
+	expiredDrops  atomic.Uint64
+	baseUserID    string
 
 	// cookieJar holds the shared cookie jar for all fetchDocInfo / WebSocket
 	// dials. It is preserved across reconnects and can be replaced by
@@ -154,11 +157,22 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 
 	select {
 	case t.queue <- append([]byte(nil), data...):
-		t.RecordSend(len(data))
 		return nil
 	default:
 		return fmt.Errorf("write queue full")
 	}
+}
+
+func (t *YandexDocsTransport) Stats() transport.TransportStats {
+	st := t.BaseTransport.Stats()
+	st.QueuePackets = uint64(len(t.queue))
+	st.WriteFailures = t.writeFailures.Load()
+	st.ExpiredDrops = t.expiredDrops.Load()
+	return st
+}
+
+func (t *YandexDocsTransport) LaneHealth() transport.LaneHealth {
+	return transport.LaneHealth{Connected: t.IsConnected(), QueueLoad: float64(len(t.queue)) / float64(max(1, cap(t.queue))), WriteFailures: t.writeFailures.Load()}
 }
 
 func (t *YandexDocsTransport) connectToDoc(attempt int) {
@@ -346,6 +360,7 @@ func (t *YandexDocsTransport) writerLoop() {
 			}
 		}
 		if time.Since(pendingAt) > 15*time.Second {
+			t.expiredDrops.Add(1)
 			pending = nil
 			continue
 		}
@@ -362,11 +377,13 @@ func (t *YandexDocsTransport) writerLoop() {
 		payload := base64.StdEncoding.EncodeToString(pending)
 		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+			t.writeFailures.Add(1)
 			utils.Debugf("[YDOCS] Write error: %v", err)
 			session.Conn.Close()
 			time.Sleep(15 * time.Millisecond)
 			continue // keep pending; the reconnect will bring up a new conn
 		}
+		t.RecordSend(len(pending))
 		pending = nil
 	}
 }
@@ -431,10 +448,6 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 
-	if strings.Contains(text, "---KA---") {
-		return
-	}
-
 	// Socket.IO ping - respond with pong (use safeWrite)
 	if text == "2" {
 		if session != nil && session.Conn != nil {
@@ -449,19 +462,16 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 
 	if strings.Contains(text, "saveChanges") || strings.Contains(text, "cursor") {
-		base64Str := t.extractBase64String(text)
-		if base64Str == "" {
-			return
-		}
+		for _, base64Str := range transport.EditorPayloads(text) {
+			decoded, err := base64.StdEncoding.DecodeString(base64Str)
+			if err != nil {
+				utils.Debugf("[YDOCS] Base64 decode error: %v", err)
+				continue
+			}
 
-		decoded, err := base64.StdEncoding.DecodeString(base64Str)
-		if err != nil {
-			utils.Debugf("[YDOCS] Base64 decode error: %v", err)
-			return
+			t.RecordReceive(len(decoded))
+			t.CallReceive(decoded)
 		}
-
-		t.RecordReceive(len(decoded))
-		t.CallReceive(decoded)
 	}
 }
 
@@ -616,6 +626,29 @@ func (t *YandexDocsTransport) FetchCookies() (map[string]string, error) {
 // and forces the current session to reconnect so the next fetchDocInfo uses
 // the new cookies. It is idempotent.
 func (t *YandexDocsTransport) ApplyCookies(values map[string]string) error {
+	return t.ApplyCookiesForDomain("", values)
+}
+
+func (t *YandexDocsTransport) FetchCookiesForDomain(domain string) (map[string]string, error) {
+	root, ok := yandexhosts.Root(domain)
+	if !ok {
+		return nil, fmt.Errorf("unsupported verification cookie domain")
+	}
+	u, _ := url.Parse("https://" + root + "/")
+	t.jarMu.RLock()
+	jar := t.cookieJar
+	t.jarMu.RUnlock()
+	if jar == nil {
+		return nil, fmt.Errorf("ydocs: cookie jar is nil")
+	}
+	out := map[string]string{}
+	for _, c := range jar.Cookies(u) {
+		out[c.Name] = c.Value
+	}
+	return out, nil
+}
+
+func (t *YandexDocsTransport) ApplyCookiesForDomain(domain string, values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
@@ -628,11 +661,28 @@ func (t *YandexDocsTransport) ApplyCookies(values map[string]string) error {
 		}
 	}
 	u := mustParseURL(t.url)
-	jar, _ := cookiejar.New(nil)
+	root := ""
+	if domain != "" {
+		var ok bool
+		root, ok = yandexhosts.Root(domain)
+		if !ok {
+			return fmt.Errorf("unsupported verification cookie domain")
+		}
+		u, _ = url.Parse("https://" + root + "/")
+	}
 	cookies := siteCookies(u, values)
-	jar.SetCookies(u, cookies)
-
+	if domain != "" {
+		for _, c := range cookies {
+			c.Domain = root
+			c.Secure = true
+		}
+	}
 	t.jarMu.Lock()
+	jar, _ := cookiejar.New(nil)
+	if domain != "" && t.cookieJar != nil {
+		jar = t.cookieJar
+	}
+	jar.SetCookies(u, cookies)
 	t.cookieJar = jar
 	t.jarMu.Unlock()
 

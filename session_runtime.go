@@ -356,7 +356,7 @@ func (s *sessionRuntime) stats() {
 		}
 		previous = ready
 		st := s.Stats()
-		log.Printf("[PAPERFLUX_STATS] rx=%d tx=%d ping=%d queue=%d retry=%d expired=%d", s.rx.Load(), s.tx.Load(), s.session.DataRTT().Milliseconds(), st.QueuePackets, st.RetryQueued, st.ExpiredDrops)
+		log.Printf("[PAPERFLUX_STATS] rx=%d tx=%d ping=%d queue=%d retry=%d expired=%d queue_bytes=%d queue_waits=%d queue_timeouts=%d write_failures=%d", s.rx.Load(), s.tx.Load(), s.session.DataRTT().Milliseconds(), st.QueuePackets, st.RetryQueued, st.ExpiredDrops, st.QueueBytes, st.QueueWaits, st.QueueTimeouts, st.WriteFailures)
 	}
 }
 
@@ -476,9 +476,9 @@ func (h *sessionIPC) OnCookies(p *ipc.CookiesOfferPayload) {
 	}
 	var err error
 	if p.Remote {
-		err = h.manager.OfferCookies(p.Transport, p.Jar)
+		err = h.manager.OfferCookiesForDomain(p.Transport, p.Domain, p.Jar)
 	} else {
-		err = h.manager.AcceptCookies(p.Transport, p.Jar)
+		err = h.manager.AcceptCookiesForDomain(p.Transport, p.Domain, p.Jar)
 	}
 	if err == nil {
 		h.mu.Lock()
@@ -498,7 +498,7 @@ func (h *sessionIPC) onPeerCookies(payload []byte) {
 	if err != nil {
 		return
 	}
-	name := h.manager.MatchingCookieCarrier(cp.Transport, cp.Doc, cp.Jar)
+	name := h.manager.MatchingCookieCarrierForDomain(cp.Transport, cp.Doc, cp.Domain, cp.Jar)
 	if name == "" {
 		return
 	}

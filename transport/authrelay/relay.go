@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 	"universal-bypass-tool/transport/control"
+	"universal-bypass-tool/transport/yandexhosts"
 )
 
 const Subtype control.Subtype = 0x70
@@ -106,6 +107,9 @@ func AllowedAddress(address string) bool {
 		return false
 	}
 	host = strings.ToLower(host)
+	if _, ok := yandexhosts.Root(host); ok {
+		return true
+	}
 	for _, domain := range []string{"yandex.ru", "yandex.com", "yandex.net", "yastatic.net", "smartcaptcha.yandexcloud.net"} {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true

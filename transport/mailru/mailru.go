@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -43,11 +45,16 @@ type MailruDocsInfo struct {
 }
 
 type DocSession struct {
-	Info       MailruDocsInfo
-	Conn       *websocket.Conn
-	WriteQueue chan []byte
-	UserID     string
-	writeMu    sync.Mutex
+	Info               MailruDocsInfo
+	Conn               *websocket.Conn
+	WriteQueue         chan []byte
+	UserID             string
+	writeMu            sync.Mutex
+	enginePings        atomic.Uint64
+	enginePongs        atomic.Uint64
+	enginePingInterval int
+	enginePingTimeout  int
+	editorAuthed       atomic.Bool
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
@@ -62,10 +69,12 @@ type MailruDocsTransport struct {
 
 	weblink    string
 	session    *DocSession
+	pending    *DocSession
 	writeQueue chan []byte
 
-	userCounter atomic.Int32
-	baseUserID  string
+	userCounter   atomic.Int32
+	writeFailures atomic.Uint64
+	baseUserID    string
 }
 
 // NewMailruDocsTransport accepts either a bare weblink ("AbCdEfGh1/IjKlMnOp2")
@@ -115,11 +124,16 @@ func (t *MailruDocsTransport) Stop() error {
 	_ = t.BaseTransport.Stop()
 	t.Mu.Lock()
 	session := t.session
+	pending := t.pending
 	t.session = nil
+	t.pending = nil
 	t.writeQueue = nil
 	t.Mu.Unlock()
 	if session != nil && session.Conn != nil {
 		_ = session.Conn.Close()
+	}
+	if pending != nil && pending.Conn != nil {
+		_ = pending.Conn.Close()
 	}
 	return nil
 }
@@ -140,11 +154,30 @@ func (t *MailruDocsTransport) Send(data []byte) error {
 
 	select {
 	case queue <- append([]byte(nil), data...):
-		t.RecordSend(len(data))
 		return nil
 	default:
 		return fmt.Errorf("write queue full")
 	}
+}
+
+func (t *MailruDocsTransport) Stats() transport.TransportStats {
+	st := t.BaseTransport.Stats()
+	t.Mu.RLock()
+	st.QueuePackets = uint64(len(t.writeQueue))
+	t.Mu.RUnlock()
+	st.WriteFailures = t.writeFailures.Load()
+	return st
+}
+
+func (t *MailruDocsTransport) LaneHealth() transport.LaneHealth {
+	t.Mu.RLock()
+	queue := t.writeQueue
+	t.Mu.RUnlock()
+	load := 0.0
+	if queue != nil && cap(queue) > 0 {
+		load = float64(len(queue)) / float64(cap(queue))
+	}
+	return transport.LaneHealth{Connected: t.IsConnected(), QueueLoad: load, WriteFailures: t.Stats().WriteFailures}
 }
 
 func (t *MailruDocsTransport) connectToDoc(attempt int) {
@@ -224,24 +257,28 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		}
 
 		t.Mu.Lock()
-		t.session = session
-		t.SetConnected(true)
-		t.Mu.Unlock()
-
-		// Auth - fired immediately, same as the Yandex.Docs transport. No
-		// need to wait for the server's own "0{"/"40" handshake frames
-		// first: Mail.ru's coauthoring server buffers and processes these
-		// once its own session state catches up, and waiting for explicit
-		// acks here only stretches the outage window on every reconnect
-		// (Mail.ru can delay a fresh joiner's auth confirmation by up to
-		// ~30s while it reconciles with the other participant).
-		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		if err := session.safeWrite(websocket.TextMessage, []byte(auth1)); err != nil {
+		if !t.IsRunning() || t.pending != nil || t.session != nil {
+			t.Mu.Unlock()
 			_ = conn.Close()
-			t.dropSession(session)
-			t.scheduleReconnect(attempt)
 			return
 		}
+		t.pending = session
+		t.Mu.Unlock()
+		handshakeErr := waitMailruSocketIO(session, info.Token, 15*time.Second)
+		t.Mu.Lock()
+		current := t.pending == session && t.IsRunning()
+		if (handshakeErr != nil || !current) && t.pending == session {
+			t.pending = nil
+		}
+		if handshakeErr != nil || !current {
+			t.Mu.Unlock()
+			_ = conn.Close()
+			if current {
+				t.scheduleReconnect(attempt)
+			}
+			return
+		}
+		t.Mu.Unlock()
 
 		authMsg := map[string]interface{}{
 			"type":                "auth",
@@ -283,8 +320,16 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		messagePart, _ := json.Marshal([]interface{}{"message", authMsg})
 		if err := session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart)))); err != nil {
 			_ = conn.Close()
-			t.dropSession(session)
+			t.Mu.Lock()
+			if t.pending == session {
+				t.pending = nil
+			}
+			t.Mu.Unlock()
 			t.scheduleReconnect(attempt)
+			return
+		}
+		if !t.publishSession(session) {
+			_ = conn.Close()
 			return
 		}
 
@@ -299,6 +344,9 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 				if !current {
 					return
 				}
+				code, timedOut := mailruDisconnectDetails(err)
+				// Never log editor URLs, JWTs or a remote error's free-form text.
+				log.Printf("[PAPERFLUX_MAILRU] connection_lost uptime=%s close_code=%d timeout=%t engine_pings=%d engine_pongs=%d editor_auth=%t", time.Since(connectedAt).Round(time.Millisecond), code, timedOut, session.enginePings.Load(), session.enginePongs.Load(), session.editorAuthed.Load())
 
 				next := attempt
 				if time.Since(connectedAt) > 15*time.Second {
@@ -311,6 +359,29 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			t.handleMessage(session, message)
 		}
 	}()
+}
+
+func mailruDisconnectDetails(err error) (int, bool) {
+	var closeErr *websocket.CloseError
+	var networkErr net.Error
+	code := 0
+	if errors.As(err, &closeErr) {
+		code = closeErr.Code
+	}
+	timedOut := errors.As(err, &networkErr) && networkErr.Timeout()
+	return code, timedOut
+}
+
+func (t *MailruDocsTransport) publishSession(session *DocSession) bool {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+	if !t.IsRunning() || t.pending != session {
+		return false
+	}
+	t.pending = nil
+	t.session = session
+	t.SetConnected(true)
+	return true
 }
 
 // Only the reader that still owns the active connection may change state.
@@ -358,6 +429,7 @@ func (t *MailruDocsTransport) writerLoop() {
 		payload := base64.StdEncoding.EncodeToString(pending)
 		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+			t.writeFailures.Add(1)
 			utils.Debugf("[M-DOCS] Write error: %v", err)
 			_ = session.Conn.Close() // Wake the reader so it can reconnect.
 			select {
@@ -367,14 +439,18 @@ func (t *MailruDocsTransport) writerLoop() {
 			}
 			continue // keep pending; the reconnect will bring up a new conn
 		}
+		t.RecordSend(len(pending))
 		pending = nil
 	}
 }
 
 func (t *MailruDocsTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
+	interval := t.GetConfig().KeepAliveInterval
+	if interval <= 0 || interval > 15*time.Second {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
 
 	for t.IsRunning() {
 		select {
@@ -387,7 +463,7 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 		t.Mu.Unlock()
 
 		if session != nil && session.Conn != nil {
-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
+			if err := session.sendEditorKeepAlive(); err != nil {
 				utils.Debugf("[M-DOCS] Keep-alive failed: %v", err)
 				t.Mu.RLock()
 				if t.session == session {
@@ -400,17 +476,48 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 	}
 }
 
+func (s *DocSession) sendEditorKeepAlive() error {
+	// Engine.IO heartbeat and cursor traffic do not extend the editor's
+	// separate idle lease. Use the editor client's standard session message,
+	// without editing or saving document contents. Never send before auth.
+	if s.editorAuthed.Load() {
+		if err := s.safeWrite(websocket.TextMessage, []byte(`42["message",{"type":"extendSession","idletime":0}]`)); err != nil {
+			return err
+		}
+	}
+	return s.safeWrite(websocket.TextMessage, []byte(`42["message",{"type":"cursor","cursor":"18;---KA---"}]`))
+}
+
 func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
-
-	if strings.Contains(text, "---KA---") {
-		return
+	event := parseMailruEditorEvent(data)
+	if session != nil && session.Conn != nil {
+		var response string
+		switch {
+		case event.Type == "authChanges":
+			response = `42["message",{"type":"authChangesAck"}]`
+		case event.Type == "connectState" && event.WaitAuth:
+			// Complete only our own collaborative authentication lock. The
+			// server checks ownership; no save, deletion or edit-lock release.
+			response = `42["message",{"type":"unLockDocument","unlock":true,"isSave":false,"releaseLocks":false}]`
+		}
+		if response != "" {
+			if err := session.safeWrite(websocket.TextMessage, []byte(response)); err != nil {
+				_ = session.Conn.Close()
+			} else {
+				log.Printf("[PAPERFLUX_MAILRU] editor_control_completed type=%s", event.Type)
+			}
+			return
+		}
 	}
 
 	// Socket.IO ping - respond with pong
 	if text == "2" {
 		if session != nil && session.Conn != nil {
-			session.safeWrite(websocket.TextMessage, []byte("3"))
+			session.enginePings.Add(1)
+			if session.safeWrite(websocket.TextMessage, []byte("3")) == nil {
+				session.enginePongs.Add(1)
+			}
 		}
 		return
 	}
@@ -419,25 +526,67 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 
 	if strings.Contains(text, `"type":"auth"`) && strings.Contains(text, `"result":1`) {
+		if session != nil {
+			session.editorAuthed.Store(true)
+		}
 		utils.Debugf("[M-DOCS] Auth OK for user %s", session.UserID)
 		return
 	}
+	if !strings.Contains(text, "cursor") && strings.HasPrefix(text, "42[") && len(text) < 65536 {
+		var event []json.RawMessage
+		if json.Unmarshal(data[2:], &event) == nil && len(event) > 1 {
+			var notice struct {
+				Type     string `json:"type"`
+				Code     int    `json:"code"`
+				Interval int    `json:"interval"`
+			}
+			if json.Unmarshal(event[1], &notice) == nil {
+				switch notice.Type {
+				case "session", "disconnectReason", "error":
+					log.Printf("[PAPERFLUX_MAILRU] editor_event type=%s code=%d interval_ms=%d", notice.Type, notice.Code, notice.Interval)
+				}
+			}
+		}
+	}
 
 	if strings.Contains(text, "cursor") {
-		base64Str := t.extractBase64String(text)
-		if base64Str == "" {
-			return
-		}
+		for _, base64Str := range transport.EditorPayloads(text) {
+			decoded, err := base64.StdEncoding.DecodeString(base64Str)
+			if err != nil {
+				utils.Debugf("[M-DOCS] Base64 decode error: %v", err)
+				continue
+			}
 
-		decoded, err := base64.StdEncoding.DecodeString(base64Str)
-		if err != nil {
-			utils.Debugf("[M-DOCS] Base64 decode error: %v", err)
-			return
+			t.RecordReceive(len(decoded))
+			t.CallReceive(decoded)
 		}
-
-		t.RecordReceive(len(decoded))
-		t.CallReceive(decoded)
 	}
+}
+
+type mailruEditorEvent struct {
+	Type     string `json:"type"`
+	WaitAuth bool   `json:"waitAuth"`
+}
+
+func parseMailruEditorEvent(data []byte) mailruEditorEvent {
+	// Do not act on strings embedded inside cursor payloads or events on
+	// other Socket.IO namespaces. Parse only bounded editor envelopes.
+	if len(data) > 256*1024 || !bytes.HasPrefix(data, []byte("42[")) {
+		return mailruEditorEvent{}
+	}
+	var envelope []json.RawMessage
+	if json.Unmarshal(data[2:], &envelope) != nil || len(envelope) != 2 {
+		return mailruEditorEvent{}
+	}
+	var name string
+	if json.Unmarshal(envelope[0], &name) != nil || name != "message" {
+		return mailruEditorEvent{}
+	}
+	var event mailruEditorEvent
+	if json.Unmarshal(envelope[1], &event) != nil {
+		return mailruEditorEvent{}
+	}
+	return event
 }
 
 func (t *MailruDocsTransport) extractBase64String(response string) string {

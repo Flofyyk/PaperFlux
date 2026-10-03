@@ -59,7 +59,7 @@ func (t *TCPTunnel) releaseConnection(conn net.Conn) {
 	delete(t.connections, conn)
 	t.connectionsMu.Unlock()
 }
-func (t *TCPTunnel) ActiveFlows() int { return len(t.proxyFlows) }
+func (t *TCPTunnel) ActiveFlows() int { return len(t.proxyFlows) + len(t.proxyProbeFlows) }
 
 // ServeHTTPProxy serves a plain HTTP proxy (CONNECT and absolute-URI
 // requests) on ln, opening every upstream connection with dial. It is what

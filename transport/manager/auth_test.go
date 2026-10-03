@@ -68,6 +68,15 @@ func connectedManagers(t *testing.T, exitProvider CookieProvider) (client, exit 
 	if err := client.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// Client.Start waits for its own handshake, not for the asynchronous
+	// final hello to reach the exit. Auth forwarding requires both peers.
+	deadline := time.Now().Add(3 * time.Second)
+	for !exit.session.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("exit handshake did not complete")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	return client, exit
 }
 
