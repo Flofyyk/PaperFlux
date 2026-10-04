@@ -90,6 +90,94 @@ func TestSessionDiscoversRestartedExitBeforeStaleTimeout(t *testing.T) {
 	})
 }
 
+func TestSessionUnreadyExitRepeatsAnnouncement(t *testing.T) {
+	_, exit, _, ew := linkedSessions(t, "direct")
+	blackhole(ew["direct"])
+	if err := exit.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var sender [32]byte
+	sender[0] = 42
+	offer := &control.Envelope{
+		Kind: control.KindHello, Role: control.RoleClient, Local: sender,
+		Hello: &control.HelloTail{Capabilities: control.Capabilities(testParams.Capabilities), MaxPacketSize: uint16(testParams.MaxPacketSize)},
+	}
+	count := func() int {
+		ew["direct"].mu.Lock()
+		defer ew["direct"].mu.Unlock()
+		return len(ew["direct"].packets)
+	}
+	exit.receiveHello(exit.links["direct"], offer)
+	eventually(t, "initial announcement", func() bool { return count() > 0 })
+	previous := count()
+	exit.receiveHello(exit.links["direct"], offer)
+	eventually(t, "announcement retry after loss", func() bool { return count() > previous })
+	if exit.IsConnected() {
+		t.Fatal("announcement accepted data without a challenge echo")
+	}
+}
+
+func TestSessionHealthyDiscoveryDoesNotRotateEpoch(t *testing.T) {
+	client, exit, _, _ := linkedSessions(t, "direct", "secondary")
+	startPair(t, client, exit)
+	clientEpoch, exitEpoch := client.DataEpoch(), exit.DataEpoch()
+	client.mu.Lock()
+	offer := client.buildHello()
+	client.mu.Unlock()
+	offer.Peer = [32]byte{}
+	offer.Hello.Ready = 0
+	for i := 0; i < 10; i++ {
+		exit.receiveHello(exit.links["direct"], offer)
+	}
+	if client.DataEpoch() != clientEpoch || exit.DataEpoch() != exitEpoch {
+		t.Fatal("healthy discovery rotated an established data epoch")
+	}
+	var got atomic.Int32
+	exit.Receive(func([]byte) { got.Add(1) })
+	if err := client.SendSessionPacket(clientEpoch, testIPv4(40, 6)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "existing epoch data after discovery", func() bool { return got.Load() == 1 })
+}
+
+func TestSessionClientRequiresFreshExitReplacementChallenge(t *testing.T) {
+	client, exit, _, _ := linkedSessions(t, "direct")
+	startPair(t, client, exit)
+	client.mu.Lock()
+	peer, local, epoch := client.peer, client.local, client.dataEpoch
+	client.mu.Unlock()
+	var stranger, random [32]byte
+	stranger[0], random[0] = 42, 43
+	offer := &control.Envelope{
+		Kind: control.KindHello, Role: control.RoleExit, Local: stranger,
+		Hello: &control.HelloTail{Capabilities: control.Capabilities(testParams.Capabilities), MaxPacketSize: uint16(testParams.MaxPacketSize), Ready: 1},
+	}
+	for _, address := range [][32]byte{{}, local, random} {
+		offer.Peer = address
+		client.receiveHello(client.links["direct"], offer)
+		client.mu.Lock()
+		unchanged := client.peer == peer && client.local == local && client.dataEpoch == epoch && client.peerConfirmed
+		client.mu.Unlock()
+		if !unchanged {
+			t.Fatal("replayed exit HELLO replaced the established peer")
+		}
+	}
+	client.mu.Lock()
+	fresh := client.candidate.local
+	client.mu.Unlock()
+	if fresh == local {
+		t.Fatal("replacement challenge reused the standing nonce")
+	}
+	offer.Peer = fresh
+	client.receiveHello(client.links["direct"], offer)
+	client.mu.Lock()
+	replaced := client.peer == stranger && client.local == fresh && client.dataEpoch == epoch+1 && client.peerConfirmed
+	client.mu.Unlock()
+	if !replaced {
+		t.Fatal("fresh confirmed replacement did not advance exactly one epoch")
+	}
+}
+
 func hello(t *testing.T, local, peer [32]byte) []byte {
 	t.Helper()
 	raw, err := (&control.Envelope{

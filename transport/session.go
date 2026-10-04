@@ -646,6 +646,10 @@ func (s *Session) buildHello() *control.Envelope {
 }
 
 func (s *Session) helloVia(name string) error {
+	return s.sendHelloVia(name, false)
+}
+
+func (s *Session) sendHelloVia(name string, announce bool) error {
 	s.mu.Lock()
 	link, ok := s.links[name]
 	if !ok {
@@ -653,6 +657,14 @@ func (s *Session) helloVia(name string) error {
 		return fmt.Errorf("transport %q not found", name)
 	}
 	env := s.buildHello()
+	// A restarted exit must announce itself without addressing the client's
+	// standing nonce. The established client can then issue a fresh replacement
+	// challenge; an old addressed HELLO cannot prove possession of that challenge.
+	// Recheck readiness here because another carrier may already have completed it.
+	if announce && s.exit && !s.ready {
+		env.Peer = [32]byte{}
+		env.Hello.Ready = 0
+	}
 	s.mu.Unlock()
 
 	raw, err := env.Encode()
@@ -925,6 +937,7 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 	}
 	changed := sender != s.peer
 	wasReady := s.ready
+	announce := s.exit && !wasReady && zero
 	s.peer = sender
 	if echo {
 		if !wasReady {
@@ -943,13 +956,13 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 	// Reply through every live transport so the peer sees the new ready
 	// state regardless of which one it is listening on.
 	var names []string
-	if changed || (!wasReady && echo) || (wasReady && env.Hello.Ready == 0) {
+	if changed || announce || (!wasReady && echo) || (wasReady && env.Hello.Ready == 0) {
 		names = append(names, s.order...)
 	}
 	s.mu.Unlock()
 
 	for _, name := range names {
-		_ = s.helloVia(name)
+		_ = s.sendHelloVia(name, announce)
 	}
 }
 

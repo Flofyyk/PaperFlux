@@ -26,6 +26,8 @@ The main Yandex Docs transport uses collaboration cursor messages without writin
 
 If one document channel disconnects, the remaining channel continues carrying traffic while the disconnected channel recovers independently. Tunnel readiness requires document authorization, an authenticated session and successful DNS/TCP checks.
 
+After a server restart, Session confirms the connection with a fresh challenge without waiting for the old session to time out. Stale confirmations cannot replace an established session.
+
 ## Deployment
 
 Linux `amd64` and `arm64` binaries are available in [releases](https://github.com/Flofyyk/PaperFlux/releases/latest). Use `uname -m` to select an architecture: `x86_64` maps to `amd64`, and `aarch64` maps to `arm64`.
