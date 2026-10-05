@@ -45,28 +45,73 @@ func (m *Manager) fetchCookiesForDomain(name, domain string) (map[string]string,
 // Existing Domain fields in IPC/control now keep regional cookies scoped.
 // Old offers without Domain retain their historical document-domain behavior.
 func (m *Manager) AcceptCookiesForDomain(name, domain string, jar map[string]string) error {
-	if domain == "" {
-		return m.AcceptCookies(name, jar)
+	return m.acceptCookiesForDomain(name, domain, jar, true)
+}
+
+// A background snapshot from another node is not a fresh browser result on
+// this node. Preserve local values; provider checks can be IP/UA-bound.
+func (m *Manager) acceptPeerCookiesForDomain(name, domain string, jar map[string]string) error {
+	return m.acceptCookiesForDomain(name, domain, shareableCookies(jar), false)
+}
+
+func (m *Manager) acceptCookiesForDomain(name, domain string, jar map[string]string, incomingWins bool) error {
+	m.cookieMu.Lock()
+	defer m.cookieMu.Unlock()
+	var root string
+	apply := func(values map[string]string) error { return m.ApplyCookiesFor(name, values) }
+	if domain != "" {
+		provider, normalized, err := m.cookieDomainProvider(name, domain)
+		if err != nil {
+			return err
+		}
+		root = normalized
+		apply = func(values map[string]string) error { return provider.ApplyCookiesForDomain(root, values) }
 	}
-	provider, root, err := m.cookieDomainProvider(name, domain)
+	current, err := m.fetchCookiesForDomain(name, domain)
 	if err != nil {
 		return err
 	}
-	if err := provider.ApplyCookiesForDomain(root, jar); err != nil {
-		return err
+	// An empty offer is not an instruction to erase the profile's login.
+	if len(jar) == 0 {
+		return nil
 	}
 	m.mu.RLock()
 	store, key := m.store, m.cookieKeys[name]
+	docURL := ""
+	if entry := m.entries[name]; entry != nil {
+		docURL = entry.URL
+	}
 	m.mu.RUnlock()
-	if store != nil && key != "" {
-		// Keep the primary-domain key compatible with existing profile seeding
-		// and older peers; only other regions need a separate scoped record.
-		if doc, err := url.Parse(m.entryURL(name)); err == nil {
-			if primary, ok := yandexhosts.Root(doc.Hostname()); ok && primary == root {
-				return store.Save(key, jar)
-			}
+	// The primary record keeps backward compatibility with profile seeding.
+	// A regional offer must never import the primary domain's saved cookies.
+	if root != "" && key != "" {
+		primary := ""
+		if doc, err := url.Parse(docURL); err == nil {
+			primary, _ = yandexhosts.Root(doc.Hostname())
 		}
-		return store.Save(domainStoreKey(key, root), jar)
+		if primary != root {
+			key = domainStoreKey(key, root)
+		}
+	}
+	var saved map[string]string
+	if store != nil && key != "" {
+		saved = store.Load(key)
+	}
+	// Live HTTP cookies can be fresher than the persisted snapshot; the
+	// just-completed verification takes precedence over both of them.
+	merged := mergeCookies(saved, current, jar)
+	if !incomingWins {
+		merged = mergeCookies(saved, jar, current)
+		// A stale background response must not wake or rewrite this lane.
+		if containsCookies(current, merged) {
+			return nil
+		}
+	}
+	if err := apply(merged); err != nil {
+		return err
+	}
+	if store != nil && key != "" {
+		return store.Save(key, merged)
 	}
 	return nil
 }

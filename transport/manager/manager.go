@@ -10,7 +10,6 @@ package manager
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +57,8 @@ type Manager struct {
 	// Cookie persistence: store key per transport name.
 	store      *transport.CookieStore
 	cookieKeys map[string]string
+	// Serialize cookie read/merge/apply/save across IPC and peer offers.
+	cookieMu sync.Mutex
 
 	// Callbacks wired from main.go / mobile bridge.
 	dataCallback    func([]byte)
@@ -272,16 +273,7 @@ func (m *Manager) UseCookieStore(store *transport.CookieStore, name, key string)
 // AcceptCookies applies a jar to one transport and persists it, whether it
 // came from the peer over the control channel or from the local app (IPC).
 func (m *Manager) AcceptCookies(name string, jar map[string]string) error {
-	if err := m.ApplyCookiesFor(name, jar); err != nil {
-		return err
-	}
-	m.mu.RLock()
-	store, key := m.store, m.cookieKeys[name]
-	m.mu.RUnlock()
-	if store != nil && key != "" {
-		return store.Save(key, jar)
-	}
-	return nil
+	return m.AcceptCookiesForDomain(name, "", jar)
 }
 
 // cookieTransport resolves a peer's carrier by document URL, then by its
@@ -361,12 +353,13 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		if !m.session.IsExit() {
 			return
 		}
-		jar, err := m.FetchCookiesFor(name)
+		jar, err := m.fetchCookiesForDomain(name, cp.Domain)
 		if err != nil {
 			utils.Debugf("[MANAGER] fetch cookies (%s): %v", name, err)
 			return
 		}
-		body, _ := (&control.CookiesPayload{Transport: name, Doc: m.entryURL(name), Jar: jar, Reason: "requested"}).Encode()
+		// A passed check can be shared; the exit owner's account login cannot.
+		body, _ := (&control.CookiesPayload{Transport: name, Doc: m.entryURL(name), Domain: cp.Domain, Jar: shareableCookies(jar), Reason: "requested"}).Encode()
 		_ = m.SendControl(control.SubtypeCookiesResponse, body)
 	case control.SubtypeCookiesResponse, control.SubtypeCookiesOffer:
 		if len(cp.Jar) == 0 {
@@ -374,10 +367,14 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		}
 		// An unchanged response must not wake a carrier out of its normal
 		// reconnect backoff or rewrite the profile cookie store.
-		if current, err := m.fetchCookiesForDomain(name, cp.Domain); err == nil && maps.Equal(current, cp.Jar) {
+		if current, err := m.fetchCookiesForDomain(name, cp.Domain); err == nil && containsCookies(current, cp.Jar) {
 			return
 		}
-		if err := m.AcceptCookiesForDomain(name, cp.Domain, cp.Jar); err != nil {
+		accept := m.AcceptCookiesForDomain
+		if sub == control.SubtypeCookiesResponse {
+			accept = m.acceptPeerCookiesForDomain
+		}
+		if err := accept(name, cp.Domain, cp.Jar); err != nil {
 			utils.Debugf("[MANAGER] apply cookies (%s): %v", name, err)
 		}
 	}
@@ -423,7 +420,7 @@ func (m *Manager) MatchingCookieCarrierForDomain(name, doc, domain string, jar m
 		return ""
 	}
 	current, err := m.fetchCookiesForDomain(local, domain)
-	if err != nil || !maps.Equal(current, jar) {
+	if err != nil || !containsCookies(current, jar) {
 		return ""
 	}
 	return local

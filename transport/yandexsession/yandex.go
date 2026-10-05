@@ -679,7 +679,9 @@ func (t *YandexDocsTransport) ApplyCookiesForDomain(domain string, values map[st
 	}
 	t.jarMu.Lock()
 	jar, _ := cookiejar.New(nil)
-	if domain != "" && t.cookieJar != nil {
+	// Updating one domain must not discard the other regional domains. The
+	// manager supplies a merged snapshot for the updated document's domain.
+	if t.cookieJar != nil {
 		jar = t.cookieJar
 	}
 	jar.SetCookies(u, cookies)

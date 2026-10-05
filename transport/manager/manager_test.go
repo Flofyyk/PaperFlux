@@ -144,6 +144,11 @@ func TestManagerIgnoresUnchangedCookieResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.DispatchControl(control.SubtypeCookiesResponse, body)
+	if provider.applies != 0 {
+		t.Fatal("background snapshot overwrote an existing local cookie")
+	}
+	// Only an explicit verification offer supersedes this node's current jar.
+	m.DispatchControl(control.SubtypeCookiesOffer, body)
 	if provider.applies != 1 {
 		t.Fatalf("refreshed jar applied %d times", provider.applies)
 	}

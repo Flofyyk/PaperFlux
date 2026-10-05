@@ -502,6 +502,12 @@ func (h *sessionIPC) onPeerCookies(payload []byte) {
 	if name == "" {
 		return
 	}
+	// Matching stored values only proves delivery, not a passed provider check.
+	// The periodic VPS cookie response may contain the same unusable jar. Do
+	// not cycle pending IDs/prompts until this document actually reconnects.
+	if !h.manager.IsCookieCarrierConnected(name) {
+		return
+	}
 	h.mu.Lock()
 	key := "false/" + name
 	request := h.pending[key]
