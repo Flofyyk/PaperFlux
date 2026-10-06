@@ -10,9 +10,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
-// Experimental per-process opt-in. Unset/default retains gVisor's recovery;
 // classic disables RACK/TLP but retains duplicate-ACK/SACK and RTO recovery.
-// CLI rejects classic on non-document transports. No production default flip.
+// Explicit default/rack retains gVisor's recovery. The CLI resolves auto to
+// classic only for document transports, leaving unrelated transports unchanged.
 func ParseTCPRecoveryMode(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "default", "rack":
@@ -22,6 +22,18 @@ func ParseTCPRecoveryMode(value string) (string, error) {
 	default:
 		return "", fmt.Errorf("invalid TCP recovery mode (want default or classic)")
 	}
+}
+
+func ResolveTCPRecoveryMode(value, provider string) (string, error) {
+	if normalized := strings.ToLower(strings.TrimSpace(value)); normalized == "" || normalized == "auto" {
+		switch provider {
+		case "yandex", "vyandex", "mailru":
+			return "classic", nil
+		default:
+			return "default", nil
+		}
+	}
+	return ParseTCPRecoveryMode(value)
 }
 
 func configureTCPRecovery(s *stack.Stack, mode string) error {

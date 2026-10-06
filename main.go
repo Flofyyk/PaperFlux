@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	buildVersion = "0.5.11"
+	buildVersion = "0.5.13"
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
@@ -48,7 +48,7 @@ func main() {
 	authAddress := flag.String("auth-service", "", "Encrypted verification-only listener (exit) or address (client)")
 	clientIPFlag := flag.String("client-ip", "10.10.10.2", "Virtual IPv4 address for this Android worker")
 	exitModeFlag := flag.String("mode", "raw", "Exit-node mode: raw or proxy")
-	tcpRecoveryFlag := flag.String("tcp-recovery", os.Getenv("PAPERFLUX_TCP_RECOVERY"), "Experimental document TCP recovery: default or classic (A/B only)")
+	tcpRecoveryFlag := flag.String("tcp-recovery", os.Getenv("PAPERFLUX_TCP_RECOVERY"), "TCP recovery: auto (classic for document transports), classic or rack")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, cupsonline, mailru, oneme, relayv2)")
 	documentURLs := flag.String("urls", "", "Comma-separated Yandex Docs URLs for parallel document lanes")
 	volgaURL := flag.String("volga-url", "", "Dedicated empty editable Yandex document for the optional Volga fallback lane")
@@ -67,18 +67,18 @@ func main() {
 		fmt.Println("PaperFlux " + buildVersion)
 		return
 	}
-	tcpRecoveryMode, err := tunnel.ParseTCPRecoveryMode(*tcpRecoveryFlag)
+	tcpRecoveryMode, err := tunnel.ResolveTCPRecoveryMode(*tcpRecoveryFlag, *transportType)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if tcpRecoveryMode == "classic" && *transportType != "yandex" && *transportType != "vyandex" && *transportType != "mailru" {
-		log.Fatal("classic TCP recovery is experimental and restricted to document transports")
+		log.Fatal("classic TCP recovery is restricted to document transports")
 	}
 	if err := os.Setenv("PAPERFLUX_TCP_RECOVERY", tcpRecoveryMode); err != nil {
 		log.Fatal("cannot configure TCP recovery")
 	}
 	if tcpRecoveryMode == "classic" {
-		log.Print("[TUNNEL] experimental classic TCP recovery enabled; RACK/TLP disabled")
+		log.Print("[TUNNEL] document classic TCP recovery enabled; RACK/TLP disabled")
 	}
 	if *exitProfiles != "" {
 		if !*exitNode || *client || *exitModeFlag != "proxy" || !*useSession {

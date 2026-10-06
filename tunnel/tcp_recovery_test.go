@@ -34,3 +34,24 @@ func TestTCPRecoveryModes(t *testing.T) {
 		})
 	}
 }
+
+func TestDocumentRecoveryDefaultsAndOverrides(t *testing.T) {
+	for _, provider := range []string{"yandex", "vyandex", "mailru", "relayv2", "cupsonline", "oneme"} {
+		for _, value := range []string{"", "auto", " AUTO ", "default", "rack", "classic", "invalid"} {
+			mode, err := ResolveTCPRecoveryMode(value, provider)
+			if value == "invalid" {
+				if err == nil {
+					t.Fatal("invalid recovery accepted")
+				}
+				continue
+			}
+			want := "default"
+			if value == "classic" || ((value == "" || value == "auto" || value == " AUTO ") && (provider == "yandex" || provider == "vyandex" || provider == "mailru")) {
+				want = "classic"
+			}
+			if err != nil || mode != want {
+				t.Fatalf("provider=%s value=%q: mode=%s err=%v, want=%s", provider, value, mode, err, want)
+			}
+		}
+	}
+}

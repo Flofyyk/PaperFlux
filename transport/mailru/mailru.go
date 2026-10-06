@@ -7,6 +7,7 @@ package mailru
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -23,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/publicsuffix"
 
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
@@ -75,6 +79,7 @@ type MailruDocsTransport struct {
 	userCounter   atomic.Int32
 	writeFailures atomic.Uint64
 	baseUserID    string
+	cookieJar     *cookiejar.Jar
 }
 
 // NewMailruDocsTransport accepts either a bare weblink ("AbCdEfGh1/IjKlMnOp2")
@@ -86,6 +91,7 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 		weblink:       normalizeWeblink(weblink),
 	}
 	t.baseUserID = randUserID()
+	t.cookieJar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	return t
 }
 
@@ -223,7 +229,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		headers.Set("User-Agent", mailruUserAgent)
 		headers.Set("Origin", "https://docs.datacloudmail.ru")
 
-		utils.Debugf("[M-DOCS] WebSocket dial %s", info.WsURL)
+		utils.Debugf("[M-DOCS] WebSocket dial")
 		conn, resp, err := dialer.Dial(info.WsURL, headers)
 		if err != nil {
 			status := 0
@@ -326,6 +332,22 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			}
 			t.Mu.Unlock()
 			t.scheduleReconnect(attempt)
+			return
+		}
+		// A Socket.IO connection is not yet an accepted editor session. Keep
+		// ownership in pending (so Stop closes it) until the editor confirms.
+		if err := t.waitEditorAuth(session, 30*time.Second); err != nil {
+			_ = conn.Close()
+			t.Mu.Lock()
+			current := t.pending == session && t.IsRunning()
+			if t.pending == session {
+				t.pending = nil
+			}
+			t.Mu.Unlock()
+			if current {
+				log.Printf("[PAPERFLUX_MAILRU] editor_auth_failed")
+				t.scheduleReconnect(attempt)
+			}
 			return
 		}
 		if !t.publishSession(session) {
@@ -525,11 +547,10 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 
-	if strings.Contains(text, `"type":"auth"`) && strings.Contains(text, `"result":1`) {
-		if session != nil {
+	if event.Type == "auth" {
+		if session != nil && event.Result != nil && *event.Result == 1 {
 			session.editorAuthed.Store(true)
 		}
-		utils.Debugf("[M-DOCS] Auth OK for user %s", session.UserID)
 		return
 	}
 	if !strings.Contains(text, "cursor") && strings.HasPrefix(text, "42[") && len(text) < 65536 {
@@ -549,7 +570,7 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 		}
 	}
 
-	if strings.Contains(text, "cursor") {
+	if session != nil && session.editorAuthed.Load() && strings.Contains(text, "cursor") {
 		for _, base64Str := range transport.EditorPayloads(text) {
 			decoded, err := base64.StdEncoding.DecodeString(base64Str)
 			if err != nil {
@@ -566,6 +587,7 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 type mailruEditorEvent struct {
 	Type     string `json:"type"`
 	WaitAuth bool   `json:"waitAuth"`
+	Result   *int   `json:"result"`
 }
 
 func parseMailruEditorEvent(data []byte) mailruEditorEvent {
@@ -639,7 +661,21 @@ func reconnectBackoff(n int) time.Duration {
 // fetchDocInfo POSTs to Mail.ru's public-document editor API and parses the
 // response into the fields needed to open the collaborative WebSocket.
 func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Jar: t.cookieJar, Timeout: 15 * time.Second}
+	return t.fetchDocInfoFrom(client, "https://cloud.mail.ru/api/v4/r7/edit", weblink)
+}
+
+func (t *MailruDocsTransport) fetchDocInfoFrom(client *http.Client, apiURL, weblink string) (MailruDocsInfo, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := t.Done()
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	reqBody := map[string]string{
 		"x-email":  "anonym",
@@ -648,10 +684,12 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	}
 	jsonData, _ := json.Marshal(reqBody)
 
-	apiURL := "https://cloud.mail.ru/api/v4/r7/edit"
-	utils.Debugf("[M-DOCS] fetchDocInfo POST %s", apiURL)
+	utils.Debugf("[M-DOCS] fetch document metadata")
 
-	req, _ := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return MailruDocsInfo{}, fmt.Errorf("invalid Mail.ru API request")
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("User-Agent", mailruUserAgent)
@@ -660,7 +698,11 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return MailruDocsInfo{}, err
+		// URL errors may contain the private document link after redirects.
+		if ctx.Err() != nil {
+			return MailruDocsInfo{}, ctx.Err()
+		}
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API connection failed")
 	}
 	defer resp.Body.Close()
 
@@ -668,7 +710,18 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 		return MailruDocsInfo{}, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	const maxMetadata = 2 << 20
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadata+1))
+	if err != nil {
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API response could not be read")
+	}
+	if len(bodyBytes) > maxMetadata {
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API response too large")
+	}
+	return parseMailruDocInfo(bodyBytes)
+}
+
+func parseMailruDocInfo(bodyBytes []byte) (MailruDocsInfo, error) {
 
 	var res map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &res); err != nil {
@@ -694,6 +747,9 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	if permissions == nil {
 		permissions = make(map[string]interface{})
 	}
+	if editable, ok := permissions["edit"].(bool); !ok || !editable {
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru document must allow editing by link")
+	}
 
 	editorConfig, ok := res["editorConfig"].(map[string]interface{})
 	if !ok || editorConfig == nil {
@@ -707,8 +763,22 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 		editorUserID, _ = userObj["id"].(string)
 	}
 
-	wsBase := strings.Replace(apiBase, "https://", "wss://", 1)
-	wsURL := fmt.Sprintf("%s/doc/%s/c/?EIO=4&transport=websocket", wsBase, docKey)
+	api, err := url.Parse(apiBase)
+	if err != nil || api.Scheme != "https" || api.User != nil || api.Port() != "" || api.RawQuery != "" || api.Fragment != "" {
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API returned an invalid editor endpoint")
+	}
+	host := strings.ToLower(api.Hostname())
+	if host != "datacloudmail.ru" && !strings.HasSuffix(host, ".datacloudmail.ru") {
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API returned an untrusted editor endpoint")
+	}
+	if token == "" || docKey == "" || strings.ContainsAny(docKey, "/?#\\") || fileType == "" || docURL == "" || callbackURL == "" || editorUserID == "" {
+		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API returned incomplete editor metadata")
+	}
+	api.Scheme = "wss"
+	api.Path = strings.TrimRight(api.Path, "/") + "/doc/" + docKey + "/c/"
+	api.RawPath = ""
+	api.RawQuery = "EIO=4&transport=websocket"
+	wsURL := api.String()
 
 	return MailruDocsInfo{
 		Token:        token,

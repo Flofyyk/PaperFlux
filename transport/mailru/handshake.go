@@ -70,3 +70,31 @@ func waitMailruSocketIO(session *DocSession, token string, timeout time.Duration
 	}
 	return nil
 }
+
+func (t *MailruDocsTransport) waitEditorAuth(session *DocSession, timeout time.Duration) error {
+	if err := session.Conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	defer session.Conn.SetReadDeadline(time.Time{})
+	for t.IsRunning() {
+		kind, frame, err := session.Conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if kind != websocket.TextMessage {
+			continue
+		}
+		event := parseMailruEditorEvent(frame)
+		if string(frame) == "1" || string(frame) == "41" || strings.HasPrefix(string(frame), "44") || event.Type == "error" || event.Type == "disconnectReason" {
+			return fmt.Errorf("Mail.ru editor rejected the session")
+		}
+		if event.Type == "auth" && (event.Result == nil || *event.Result != 1) {
+			return fmt.Errorf("Mail.ru editor did not authorize editing")
+		}
+		t.handleMessage(session, frame)
+		if session.editorAuthed.Load() {
+			return nil
+		}
+	}
+	return fmt.Errorf("Mail.ru transport stopped")
+}
