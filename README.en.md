@@ -4,7 +4,7 @@
 
 PaperFlux VPN tunnel server with Yandex Docs and Mail.ru Docs transports. Receives client traffic through a document channel and forwards it to the internet.
 
-The [0.5.13 release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.13) improves Mail.ru reconnection and disables RACK/TLP by default for document transports. See the [deployment scope and limitations](docs/PUBLIC_BETA.md).
+The [0.5.13 release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.13) improves Mail.ru reconnection and disables RACK/TLP by default for document transports.
 
 ## Features
 
@@ -54,7 +54,7 @@ Replace the example document URL and key. Both endpoints must use matching IDs, 
 
 The [deployment guide](docs/DEPLOYMENT.md) covers service users, systemd and upgrades. `raw` mode requires root and additional Linux configuration. IPv6 is not supported. Legacy PFS2 is not compatible with Session.
 
-TCP recovery, buffers and proxy ingress queue settings are documented in the [transport guide](docs/TRANSPORTS.md#экспериментальный-tcp-recovery). DNS/TCP probes have a separate small connection pool that ordinary application traffic cannot occupy.
+TCP recovery, buffers and proxy ingress queue settings are documented in the [transport guide](docs/TRANSPORTS.md#tcp-recovery-для-документных-каналов). DNS/TCP probes have a separate small connection pool that ordinary application traffic cannot occupy.
 
 ## Documentation
 
