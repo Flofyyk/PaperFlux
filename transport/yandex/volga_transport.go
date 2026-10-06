@@ -208,7 +208,9 @@ func (t *YandexVolgaTransport) supervise() {
 				continue
 			}
 			if errors.Is(err, errCaptchaChallenge) || errors.Is(err, errLoginRequired) {
-				delay = 30 * time.Second
+				// Do not hammer a human CAPTCHA with unchanged credentials.
+				// ApplyCookies wakes this wait immediately after browser input.
+				delay = 10 * time.Minute
 				t.mu.Lock()
 				notify := t.notifier
 				t.mu.Unlock()

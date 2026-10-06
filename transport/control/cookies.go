@@ -13,10 +13,11 @@ type CookiesPayload struct {
 	Transport string `json:"transport,omitempty"`
 	// Doc identifies the same carrier when peers use different local names.
 	// Optional for compatibility with older peers.
-	Doc    string            `json:"doc,omitempty"`
-	Jar    map[string]string `json:"jar,omitempty"`
-	Domain string            `json:"domain,omitempty"`
-	Reason string            `json:"reason,omitempty"`
+	Doc       string            `json:"doc,omitempty"`
+	Jar       map[string]string `json:"jar,omitempty"`
+	Domain    string            `json:"domain,omitempty"`
+	Reason    string            `json:"reason,omitempty"`
+	RequestID string            `json:"requestId,omitempty"`
 }
 
 // Encode serializes the payload to JSON.

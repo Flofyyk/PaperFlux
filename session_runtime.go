@@ -268,6 +268,7 @@ func validVolgaDocument(raw string) bool {
 		u.User == nil && u.RawQuery == "" && u.Fragment == "" && volgaDocumentPath.MatchString(u.Path)
 }
 func (s *sessionRuntime) Start() error {
+	go s.authRecovery()
 	if !s.quiet {
 		go s.stats()
 	}
@@ -279,6 +280,59 @@ func (s *sessionRuntime) Start() error {
 		log.Printf("[PAPERFLUX_ROOMS] %s", s.cups.RoomList())
 	}
 	return nil
+}
+
+// Group mode suppresses per-profile stats logs, not auth lifecycle work.
+func (s *sessionRuntime) authRecovery() {
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-tick.C:
+			if s.auth != nil {
+				s.Manager.ShareConnectedYandexCheck()
+				s.auth.clearConnectedLocalPending()
+				s.auth.forwardPendingExitChecks()
+				s.auth.recoverPeerCookieConfirmations()
+			}
+		}
+	}
+}
+
+func (h *sessionIPC) recoverPeerCookieConfirmations() {
+	if h.manager.IsExit() {
+		return
+	}
+	h.mu.Lock()
+	pending := make([]ipc.CookiesRequestPayload, 0, len(h.pending))
+	for _, request := range h.pending {
+		if request.Remote {
+			pending = append(pending, *request)
+		}
+	}
+	h.mu.Unlock()
+	for _, request := range pending {
+		h.manager.RequestCookieVerification(request.Transport, request.RequestID)
+	}
+}
+
+func (h *sessionIPC) forwardPendingExitChecks() {
+	if !h.manager.IsExit() {
+		return
+	}
+	h.mu.Lock()
+	pending := make([]ipc.CookiesRequestPayload, 0, len(h.pending))
+	for _, request := range h.pending {
+		if !request.Remote {
+			pending = append(pending, *request)
+		}
+	}
+	h.mu.Unlock()
+	for _, request := range pending {
+		h.manager.ForwardPendingCookieCheck(request.Transport, request.URL, request.Reason)
+	}
 }
 func (s *sessionRuntime) Stop() error {
 	s.once.Do(func() {
@@ -336,9 +390,6 @@ func (s *sessionRuntime) stats() {
 		case <-tick.C:
 		}
 		ready := s.IsConnected()
-		if s.auth != nil {
-			s.auth.clearConnectedLocalPending()
-		}
 		// A service-channel handshake can succeed while every document is
 		// blocked by stale cookies. Ask this profile's authenticated exit for
 		// its current jars, without turning the service channel into a data path.
@@ -476,17 +527,16 @@ func (h *sessionIPC) OnCookies(p *ipc.CookiesOfferPayload) {
 	}
 	var err error
 	if p.Remote {
-		err = h.manager.OfferCookiesForDomain(p.Transport, p.Domain, p.Jar)
+		err = h.manager.OfferBrowserCookiesForDomain(p.Transport, p.Domain, p.Jar, p.RequestID)
 	} else {
 		err = h.manager.AcceptCookiesForDomain(p.Transport, p.Domain, p.Jar)
 	}
 	if err == nil {
-		h.mu.Lock()
-		delete(h.pending, key)
-		h.mu.Unlock()
-		log.Printf("[PAPERFLUX_AUTH_UPDATED] remote=%t", p.Remote)
+		// Applying/sending a jar is not provider confirmation. Retain this
+		// request until the local document or authenticated exit reconnects.
+		log.Printf("[PAPERFLUX_AUTH_SUBMITTED] remote=%t", p.Remote)
 		if h.server != nil {
-			_ = h.server.SendLog("AUTH_UPDATED:" + p.RequestID)
+			_ = h.server.SendLog("AUTH_SUBMITTED:" + p.RequestID)
 		}
 	} else {
 		log.Printf("[PAPERFLUX_AUTH_FAILED] cookie update was not accepted")
@@ -496,6 +546,24 @@ func (h *sessionIPC) OnCookies(p *ipc.CookiesOfferPayload) {
 func (h *sessionIPC) onPeerCookies(payload []byte) {
 	cp, err := control.DecodeCookies(payload)
 	if err != nil {
+		return
+	}
+	if cp.Reason == "verified" {
+		if !h.manager.MatchesVerifiedDocument(cp.Transport, cp.Doc) {
+			return
+		}
+		h.mu.Lock()
+		key := "true/" + cp.Transport
+		request := h.pending[key]
+		if request != nil && cp.RequestID != "" && cp.RequestID == request.RequestID {
+			delete(h.pending, key)
+		} else {
+			request = nil
+		}
+		h.mu.Unlock()
+		if request != nil && h.server != nil {
+			_ = h.server.SendLog("AUTH_UPDATED:" + request.RequestID)
+		}
 		return
 	}
 	name := h.manager.MatchingCookieCarrierForDomain(cp.Transport, cp.Doc, cp.Domain, cp.Jar)
@@ -528,6 +596,11 @@ func (h *sessionIPC) clearConnectedLocalPending() {
 	for key, request := range h.pending {
 		if request.Remote || !h.manager.IsCookieCarrierConnected(request.Transport) {
 			continue
+		}
+		if h.manager.IsExit() {
+			if err := h.manager.SendCookieVerification(request.Transport); err != nil {
+				continue
+			}
 		}
 		delete(h.pending, key)
 		log.Printf("[PAPERFLUX_AUTH_UPDATED] remote=false transport=%s", request.Transport)

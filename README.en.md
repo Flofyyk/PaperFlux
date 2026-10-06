@@ -4,6 +4,8 @@
 
 PaperFlux VPN tunnel server with Yandex Docs and Mail.ru Docs transports. Receives client traffic through a document channel and forwards it to the internet.
 
+New changes are available in the [0.5.12-rc.1 public test release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.12-rc.1); it does not replace the stable release automatically. See the [public beta notes](docs/PUBLIC_BETA.md) for test scope, scaling limits and the unresolved Mail.ru throughput issue.
+
 ## Features
 
 - Authenticated encrypted sessions with a separate access key for each profile.

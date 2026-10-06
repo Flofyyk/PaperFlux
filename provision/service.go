@@ -24,15 +24,24 @@ import (
 const Magic = "PFPC1"
 const MaxPayload = 8192
 
+// Catalog bounds are separate from a single encrypted profile response.
+// Keep MaxPayload unchanged so increasing catalog capacity cannot inflate
+// unauthenticated responses or break existing Android bootstrap clients.
+const MaxCatalogProfiles = 20000
+const MaxCatalogBytes = 128 << 20
+
 type Profile struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Token        string   `json:"token,omitempty"`
-	ClientIP     string   `json:"clientIp"`
-	Transport    string   `json:"transport"`
-	DocumentURL  string   `json:"documentUrl,omitempty"`
-	DocumentURLs []string `json:"documentUrls,omitempty"`
-	VolgaURL     string   `json:"volgaUrl,omitempty"`
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	Token              string   `json:"token,omitempty"`
+	ClientIP           string   `json:"clientIp"`
+	Transport          string   `json:"transport"`
+	DocumentURL        string   `json:"documentUrl,omitempty"`
+	DocumentURLs       []string `json:"documentUrls,omitempty"`
+	VolgaURL           string   `json:"volgaUrl,omitempty"`
+	ActivationRequired bool     `json:"activationRequired,omitempty"`
+	Activation         string   `json:"activation,omitempty"`
+	lookup             [32]byte
 }
 
 var volgaDocumentRE = regexp.MustCompile(`^https://disk\.yandex\.ru/i/[A-Za-z0-9_-]+$`)
@@ -51,12 +60,12 @@ func LoadFile(path string) ([]Profile, error) {
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() > 1024*1024 || (runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0) {
+	if err != nil || !info.Mode().IsRegular() || info.Size() > MaxCatalogBytes || (runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0) {
 		return nil, errors.New("profile source must be a private regular file")
 	}
 	var rows []Profile
-	decoder := json.NewDecoder(io.LimitReader(f, 1024*1024+1))
-	if decoder.Decode(&rows) != nil || len(rows) > 1024 {
+	decoder := json.NewDecoder(io.LimitReader(f, MaxCatalogBytes+1))
+	if decoder.Decode(&rows) != nil || len(rows) > MaxCatalogProfiles {
 		return nil, errors.New("invalid profile source")
 	}
 	var trailing any
@@ -64,7 +73,7 @@ func LoadFile(path string) ([]Profile, error) {
 		return nil, errors.New("invalid profile source")
 	}
 	seen := map[string]bool{}
-	for _, p := range rows {
+	for i, p := range rows {
 		id, err := strconv.Atoi(p.ID)
 		if err != nil || id < 1 || id > 41535 || len(p.Token) < 32 || len(p.Token) > 128 || seen[p.Token] || net.ParseIP(p.ClientIP).To4() == nil {
 			return nil, errors.New("invalid profile identity")
@@ -90,44 +99,16 @@ func LoadFile(path string) ([]Profile, error) {
 			return nil, errors.New("profile is too large")
 		}
 		seen[p.Token] = true
+		copy(rows[i].lookup[:], Sign(p.Token, "paperflux-profile-lookup-v1", nil))
 	}
 	return rows, nil
 }
 
 type Source func() ([]Profile, error)
-type hit struct {
-	count int
-	since time.Time
-}
 type Service struct {
 	Source Source
-	mu     sync.Mutex
-	hits   map[string]hit
-}
-
-func (s *Service) allow(address string) bool {
-	host, _, _ := net.SplitHostPort(address)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.hits == nil {
-		s.hits = map[string]hit{}
-	}
-	now := time.Now()
-	for key, value := range s.hits {
-		if now.Sub(value.since) >= time.Minute {
-			delete(s.hits, key)
-		}
-	}
-	h := s.hits[host]
-	if h.count >= 12 || (h.count == 0 && len(s.hits) >= 2048) {
-		return false
-	}
-	if h.count == 0 {
-		h.since = now
-	}
-	h.count++
-	s.hits[host] = h
-	return true
+	// Called only after a fresh proof, never with arbitrary client profile IDs.
+	Activate func(Profile) (string, error)
 }
 
 func (s *Service) Serve(ctx context.Context, listener net.Listener) error {
@@ -145,10 +126,6 @@ func (s *Service) Serve(ctx context.Context, listener net.Listener) error {
 				return nil
 			}
 			return err
-		}
-		if !s.allow(c.RemoteAddr().String()) {
-			c.Close()
-			continue
 		}
 		select {
 		case slots <- struct{}{}:
@@ -182,9 +159,15 @@ func (s *Service) Handle(c net.Conn) error {
 	}
 	var matched *Profile
 	for i := range rows {
-		lookup := Sign(rows[i].Token, "paperflux-profile-lookup-v1", nil)
+		lookup := rows[i].lookup[:]
+		if rows[i].lookup == [32]byte{} {
+			lookup = Sign(rows[i].Token, "paperflux-profile-lookup-v1", nil)
+		}
+		if !hmac.Equal(lookup, request[32:64]) {
+			continue
+		}
 		proof := Sign(rows[i].Token, "paperflux-profile-client-v1", append(append([]byte{}, pair...), request[32:64]...))
-		if hmac.Equal(lookup, request[32:64]) && hmac.Equal(proof, request[64:]) {
+		if hmac.Equal(proof, request[64:]) {
 			matched = &rows[i]
 		}
 	}
@@ -194,6 +177,15 @@ func (s *Service) Handle(c net.Conn) error {
 	}
 	public := *matched
 	public.Token = ""
+	if public.ActivationRequired || s.Activate != nil {
+		public.Activation = "busy"
+		if s.Activate != nil {
+			state, e := s.Activate(*matched)
+			if e == nil && (state == "accepted" || state == "busy" || state == "denied") {
+				public.Activation = state
+			}
+		}
+	}
 	body, err := json.Marshal(public)
 	if err != nil || len(body) > MaxPayload {
 		return errors.New("profile response exceeds limit")

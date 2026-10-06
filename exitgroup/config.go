@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-const MaxProfiles = 16
-const MaxManifestBytes = 128 << 10
+const MaxProfiles = 64
+const MaxManifestBytes = 256 << 10
 
 type Profile struct {
 	ID        string   `json:"id"`
@@ -60,14 +60,14 @@ func (m Manifest) Validate(now time.Time) error {
 			return errors.New("invalid or duplicate profile identity")
 		}
 		ip, err := netip.ParseAddr(p.ClientIP)
-		if err != nil || !ip.Is4() || !netip.MustParsePrefix("10.10.10.0/24").Contains(ip) || ip.As4()[3] < 2 || ip.As4()[3] > 254 {
+		if err != nil || !ip.Is4() || !validClientIP(ip) {
 			return errors.New("invalid virtual address")
 		}
-		if len(p.Documents) == 0 || len(p.Documents) > 2 || (p.Transport != "yandex" && p.Transport != "mailru") || (p.Transport == "mailru" && len(p.Documents) != 1) {
+		if len(p.Documents) == 0 || len(p.Documents) > 2 || (p.Transport != "yandex" && p.Transport != "mailru" && p.Transport != "vyandex") || (p.Transport != "yandex" && len(p.Documents) != 1) {
 			return errors.New("invalid transport or document count")
 		}
 		for _, doc := range p.Documents {
-			if len(doc) > 512 || (p.Transport == "yandex" && !yandex.MatchString(doc)) || (p.Transport == "mailru" && !mailru.MatchString(doc)) || rooms[doc] {
+			if len(doc) > 512 || (p.Transport != "mailru" && !yandex.MatchString(doc)) || (p.Transport == "mailru" && !mailru.MatchString(doc)) || rooms[doc] {
 				return errors.New("invalid or duplicate document")
 			}
 			rooms[doc] = true
@@ -82,6 +82,17 @@ func (m Manifest) Validate(now time.Time) error {
 		keys[p.Token] = true
 	}
 	return nil
+}
+
+// Match the controller's 20000-slot pool while retaining its original /24.
+// A group still has its own small runtime limit; larger catalogs do not mean
+// thousands of in-process transport stacks should be started together.
+func validClientIP(ip netip.Addr) bool {
+	parts := ip.As4()
+	if parts[0] != 10 || parts[1] != 10 || parts[2] < 10 || parts[2] > 89 || parts[3] < 2 || parts[3] > 254 {
+		return false
+	}
+	return int(parts[2]-10)*253+int(parts[3]-2) < 20000
 }
 
 func ReadManifest(path string, now time.Time) (Manifest, error) {

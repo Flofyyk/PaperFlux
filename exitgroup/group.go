@@ -26,6 +26,7 @@ type Metrics struct {
 	Flows         int    `json:"flows"`
 	SessionResets uint64 `json:"sessionResets,omitempty"`
 	StaleDrops    uint64 `json:"staleDrops,omitempty"`
+	LastDataUnix  int64  `json:"lastDataUnix,omitempty"`
 }
 type Runtime interface {
 	Start() error

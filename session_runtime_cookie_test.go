@@ -82,3 +82,31 @@ func TestConnectedOtherDocumentCannotClearBlockedDocumentCheck(t *testing.T) {
 		t.Fatal("local lane recovery incorrectly cleared the remote check")
 	}
 }
+
+func TestCookieSubmissionDoesNotCompleteDisconnectedLocalCheck(t *testing.T) {
+	h, _, _ := runtimeCookieFixture(t)
+	h.OnCookies(&ipc.CookiesOfferPayload{Transport: "yandex-1", RequestID: "original-id", Jar: map[string]string{"spravka": "fresh"}})
+	if h.pending["false/yandex-1"] == nil {
+		t.Fatal("cookie submission falsely completed provider check")
+	}
+}
+
+func TestRemoteConfirmationRequiresExactDocumentAndRequest(t *testing.T) {
+	h, _, _ := runtimeCookieFixture(t)
+	for _, proof := range []control.CookiesPayload{
+		{Transport: "yandex-1", Doc: "https://disk.yandex.ru/i/other", Reason: "verified", RequestID: "server-check"},
+		{Transport: "yandex-1", Doc: "https://disk.yandex.ru/i/test-only", Reason: "verified", RequestID: "old-check"},
+		{Transport: "yandex-1", Doc: "https://disk.yandex.ru/i/test-only", Reason: "verified"},
+	} {
+		body, _ := proof.Encode()
+		h.onPeerCookies(body)
+		if h.pending["true/yandex-1"] == nil {
+			t.Fatal("stale/unscoped peer confirmation cleared check")
+		}
+	}
+	body, _ := (&control.CookiesPayload{Transport: "yandex-1", Doc: "https://disk.yandex.ru/i/test-only", Reason: "verified", RequestID: "server-check"}).Encode()
+	h.onPeerCookies(body)
+	if h.pending["true/yandex-1"] != nil || h.pending["false/yandex-1"] == nil {
+		t.Fatal("verified remote document did not clear only its own check")
+	}
+}

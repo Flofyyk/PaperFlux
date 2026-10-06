@@ -561,7 +561,10 @@ func (t *YandexDocsTransport) scheduleReconnectNoCaptcha(attempt int) {
 	if !t.IsRunning() {
 		return
 	}
-	const longDelay = 30 * time.Second
+	// A pending human check has no new credentials to retry. Repeated
+	// document fetches every 30 seconds add provider load while the browser
+	// is solving the challenge. Fresh cookies still interrupt this wait.
+	const longDelay = 10 * time.Minute
 	utils.Debugf("[YDOCS] external solver needed; waiting %v before next attempt", longDelay)
 	select {
 	case <-time.After(longDelay):

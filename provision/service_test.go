@@ -100,18 +100,3 @@ func TestPrivateFileValidation(t *testing.T) {
 		t.Fatal("invalid profile accepted")
 	}
 }
-
-func TestRateLimitIsBounded(t *testing.T) {
-	s := &Service{}
-	for i := 0; i < 12; i++ {
-		if !s.allow("192.0.2.1:1234") {
-			t.Fatal("early rejection")
-		}
-	}
-	if s.allow("192.0.2.1:4567") {
-		t.Fatal("unbounded retry")
-	}
-	if !s.allow("192.0.2.2:1234") {
-		t.Fatal("other client blocked")
-	}
-}

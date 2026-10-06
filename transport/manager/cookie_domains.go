@@ -3,6 +3,7 @@ package manager
 import (
 	"fmt"
 	"net/url"
+	"time"
 	"universal-bypass-tool/transport/yandexhosts"
 )
 
@@ -45,7 +46,18 @@ func (m *Manager) fetchCookiesForDomain(name, domain string) (map[string]string,
 // Existing Domain fields in IPC/control now keep regional cookies scoped.
 // Old offers without Domain retain their historical document-domain behavior.
 func (m *Manager) AcceptCookiesForDomain(name, domain string, jar map[string]string) error {
-	return m.acceptCookiesForDomain(name, domain, jar, true)
+	m.cookieMu.Lock()
+	defer m.cookieMu.Unlock()
+	err := m.acceptCookiesForDomainLocked(name, domain, jar, true)
+	if err == nil && len(jar) > 0 {
+		m.mu.Lock()
+		if m.browserSubmitted == nil {
+			m.browserSubmitted = make(map[string]time.Time)
+		}
+		m.browserSubmitted[name] = time.Now()
+		m.mu.Unlock()
+	}
+	return err
 }
 
 // A background snapshot from another node is not a fresh browser result on
@@ -57,6 +69,10 @@ func (m *Manager) acceptPeerCookiesForDomain(name, domain string, jar map[string
 func (m *Manager) acceptCookiesForDomain(name, domain string, jar map[string]string, incomingWins bool) error {
 	m.cookieMu.Lock()
 	defer m.cookieMu.Unlock()
+	return m.acceptCookiesForDomainLocked(name, domain, jar, incomingWins)
+}
+
+func (m *Manager) acceptCookiesForDomainLocked(name, domain string, jar map[string]string, incomingWins bool) error {
 	var root string
 	apply := func(values map[string]string) error { return m.ApplyCookiesFor(name, values) }
 	if domain != "" {

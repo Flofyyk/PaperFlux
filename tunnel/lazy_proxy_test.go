@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -210,15 +212,44 @@ func TestGroupedSyntheticLoad(t *testing.T) {
 			go func() { defer c.Close(); io.Copy(c, c) }()
 		}
 	}()
-	const profiles = 16
-	const chunks = 128
+	profiles := 16
+	chunks := 128
+	if value := os.Getenv("PAPERFLUX_LOAD_PROFILES"); value != "" {
+		profiles, err = strconv.Atoi(value)
+		if err != nil || profiles < 1 || profiles > 1000 {
+			t.Fatal("invalid load profile count")
+		}
+	}
+	if value := os.Getenv("PAPERFLUX_LOAD_CHUNKS"); value != "" {
+		chunks, err = strconv.Atoi(value)
+		if err != nil || chunks < 1 || chunks > 128 {
+			t.Fatal("invalid load chunk count")
+		}
+	}
 	const chunkSize = 16384
 	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(profiles)
+	transfer := make(chan struct{})
+	var completed atomic.Int32
+	go func() {
+		ready.Wait()
+		var memory runtime.MemStats
+		runtime.ReadMemStats(&memory)
+		t.Logf("simultaneous_stacks=%d heap_bytes=%d heap_sys_bytes=%d goroutines=%d", profiles*2, memory.HeapAlloc, memory.HeapSys, runtime.NumGoroutine())
+		close(transfer)
+	}()
 	start := time.Now()
 	for i := 0; i < profiles; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			announced := false
+			defer func() {
+				if !announced {
+					ready.Done()
+				}
+			}()
 			a, b := newTransportPair()
 			proxy := NewLazyProxy(b, [4]byte{10, 10, 10, 2})
 			defer proxy.Close()
@@ -231,6 +262,9 @@ func TestGroupedSyntheticLoad(t *testing.T) {
 			}
 			defer conn.Close()
 			conn.SetDeadline(time.Now().Add(45 * time.Second))
+			announced = true
+			ready.Done()
+			<-transfer // All connections overlap, rather than sequential churn.
 			payload := make([]byte, chunkSize)
 			for n := range payload {
 				payload[n] = byte((n + id) % 251)
@@ -260,9 +294,11 @@ func TestGroupedSyntheticLoad(t *testing.T) {
 			}
 			if e = <-writer; e != nil {
 				t.Error(e)
+				return
 			}
+			completed.Add(1)
 		}(i)
 	}
 	wg.Wait()
-	t.Logf("synthetic_profiles=%d checked_bytes_per_direction=%d seconds=%.3f aggregate_payload_mbit_s=%.2f; no provider/session encryption", profiles, profiles*chunks*chunkSize, time.Since(start).Seconds(), float64(profiles*chunks*chunkSize*8)/time.Since(start).Seconds()/1e6)
+	t.Logf("synthetic_profiles=%d completed=%d checked_bytes_per_direction=%d seconds=%.3f aggregate_payload_mbit_s=%.2f; no provider/session encryption", profiles, completed.Load(), int(completed.Load())*chunks*chunkSize, time.Since(start).Seconds(), float64(int(completed.Load())*chunks*chunkSize*8)/time.Since(start).Seconds()/1e6)
 }

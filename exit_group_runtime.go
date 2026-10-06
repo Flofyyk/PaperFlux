@@ -20,15 +20,23 @@ import (
 type groupedProfile struct {
 	session *sessionRuntime
 	proxy   *tunnel.LazyProxy
+	release func()
 }
 
-func (p *groupedProfile) Start() error       { return p.session.Start() }
-func (p *groupedProfile) Close()             { p.proxy.Close(); _ = p.session.Stop() }
+func (p *groupedProfile) Start() error { return p.session.Start() }
+func (p *groupedProfile) Close() {
+	p.proxy.Close()
+	_ = p.session.Stop()
+	if p.release != nil {
+		p.release()
+		p.release = nil
+	}
+}
 func (p *groupedProfile) Reap(now time.Time) { p.proxy.Reap(now, 5*time.Minute) }
 func (p *groupedProfile) Metrics() exitgroup.Metrics {
 	st := p.session.Stats()
 	proxy := p.proxy.Snapshot()
-	return exitgroup.Metrics{Connected: st.Connected, RX: st.BytesReceived, TX: st.BytesSent, QueueBytes: proxy.QueueBytes + int(p.session.session.QueuedBatchBytes()), Dropped: proxy.Dropped, InvalidDrops: proxy.InvalidDrops, QueueDrops: proxy.QueueDrops, ActiveStack: proxy.Active, Flows: proxy.Flows, SessionResets: proxy.SessionResets, StaleDrops: proxy.StaleDrops}
+	return exitgroup.Metrics{Connected: st.Connected, RX: st.BytesReceived, TX: st.BytesSent, QueueBytes: proxy.QueueBytes + int(p.session.session.QueuedBatchBytes()), Dropped: proxy.Dropped, InvalidDrops: proxy.InvalidDrops, QueueDrops: proxy.QueueDrops, ActiveStack: proxy.Active, Flows: proxy.Flows, SessionResets: proxy.SessionResets, StaleDrops: proxy.StaleDrops, LastDataUnix: p.proxy.LastDataTime().Unix()}
 }
 
 func runExitGroup(manifestPath, statsPath, cookieDir string) error {
@@ -38,6 +46,9 @@ func runExitGroup(manifestPath, statsPath, cookieDir string) error {
 	manifestPath, _ = filepath.Abs(manifestPath)
 	statsPath, _ = filepath.Abs(statsPath)
 	cookieDir, _ = filepath.Abs(cookieDir)
+	if common := os.Getenv("PAPERFLUX_GROUP_COOKIE_DIR"); common != "" {
+		cookieDir, _ = filepath.Abs(common)
+	}
 	if manifestPath == statsPath {
 		return fmt.Errorf("manifest and stats paths must differ")
 	}
@@ -57,6 +68,15 @@ func runExitGroup(manifestPath, statsPath, cookieDir string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	group := exitgroup.New(func(p exitgroup.Profile) (exitgroup.Runtime, error) {
+		releaseStartup, err := acquireGroupStartupSlot(os.Getenv("PAPERFLUX_GROUP_START_LOCK_DIR"))
+		if err != nil {
+			return nil, err
+		}
+		defer releaseStartup()
+		release, lockErr := acquireProfileLock(filepath.Join(cookieDir, "profile-"+p.ID+".lock"))
+		if lockErr != nil {
+			return nil, lockErr
+		}
 		id, _ := strconv.Atoi(p.ID)
 		config := transport.DefaultConfig()
 		// Providers queue encrypted batches, not single IP packets. The old
@@ -66,10 +86,11 @@ func runExitGroup(manifestPath, statsPath, cookieDir string) error {
 			ID: p.ID, Token: p.Token, CookiePath: filepath.Join(cookieDir, "profile-"+p.ID+".json"), Quiet: true,
 		})
 		if err != nil {
+			release()
 			return nil, err
 		}
 		ip := netip.MustParseAddr(p.ClientIP).As4()
-		return &groupedProfile{session: session, proxy: tunnel.NewLazyProxy(session, ip)}, nil
+		return &groupedProfile{session: session, proxy: tunnel.NewLazyProxy(session, ip), release: release}, nil
 	})
 	defer group.Close()
 	if err = group.Apply(m, time.Now()); err != nil {

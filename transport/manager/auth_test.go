@@ -131,3 +131,45 @@ func TestClientDoesNotForwardAuth(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+func TestPendingCheckReachesLatePeerWithoutPollingProvider(t *testing.T) {
+	client, exit := connectedManagers(t, &fakeCookieProvider{})
+	blocked := &fakeTransport{}
+	provider := &fakeCookieProvider{}
+	if err := exit.Add("blocked", "yandex", blocked, 1, provider); err != nil {
+		t.Fatal(err)
+	}
+	exit.SetURL("blocked", "https://disk.yandex.ru/i/test-only")
+	asked := make(chan struct{}, 4)
+	client.SetRemoteAuthNotifier(func(string, string, string) { asked <- struct{}{} })
+	localReports := 0
+	exit.SetCaptchaNotifier(func(string, string, string) { localReports++ })
+	for i := 0; i < 4; i++ {
+		exit.ForwardPendingCookieCheck("blocked", "https://disk.yandex.ru/i/test-only", "smartcaptcha")
+	}
+	select {
+	case <-asked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stored exit check did not reach late peer")
+	}
+	select {
+	case <-asked:
+		t.Fatal("Stored check retry ignored forwarding rate limit")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if localReports != 0 || provider.applies != 0 {
+		t.Fatal("Retry regenerated local check or changed provider cookies")
+	}
+	blocked.mu.Lock()
+	blocked.live = true
+	blocked.mu.Unlock()
+	exit.mu.Lock()
+	delete(exit.authSent, "blocked")
+	exit.mu.Unlock()
+	exit.ForwardPendingCookieCheck("blocked", "https://disk.yandex.ru/i/test-only", "smartcaptcha")
+	select {
+	case <-asked:
+		t.Fatal("Recovered document generated another verification prompt")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

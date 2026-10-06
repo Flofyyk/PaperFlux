@@ -67,7 +67,10 @@ type Manager struct {
 	remoteAuth      CaptchaNotifier
 
 	// authSent rate-limits AuthRequired forwarding per transport.
-	authSent map[string]time.Time
+	authSent              map[string]time.Time
+	verificationIDs       map[string]string
+	verificationRequested map[string]time.Time
+	browserSubmitted      map[string]time.Time
 }
 
 // authForwardInterval bounds how often the exit re-sends AuthRequired for
@@ -353,6 +356,21 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		if !m.session.IsExit() {
 			return
 		}
+		if cp.Reason == "verify" {
+			if cp.RequestID == "" || len(cp.RequestID) > 64 || !m.MatchesVerifiedDocument(name, cp.Doc) {
+				return
+			}
+			m.mu.Lock()
+			if m.verificationIDs == nil {
+				m.verificationIDs = make(map[string]string)
+			}
+			m.verificationIDs[name] = cp.RequestID
+			m.mu.Unlock()
+			if m.IsCookieCarrierConnected(name) {
+				_ = m.SendCookieVerification(name)
+			}
+			return
+		}
 		jar, err := m.fetchCookiesForDomain(name, cp.Domain)
 		if err != nil {
 			utils.Debugf("[MANAGER] fetch cookies (%s): %v", name, err)
@@ -367,7 +385,7 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		}
 		// An unchanged response must not wake a carrier out of its normal
 		// reconnect backoff or rewrite the profile cookie store.
-		if current, err := m.fetchCookiesForDomain(name, cp.Domain); err == nil && containsCookies(current, cp.Jar) {
+		if current, err := m.fetchCookiesForDomain(name, cp.Domain); sub == control.SubtypeCookiesResponse && err == nil && containsCookies(current, cp.Jar) {
 			return
 		}
 		accept := m.AcceptCookiesForDomain
@@ -376,6 +394,13 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		}
 		if err := accept(name, cp.Domain, cp.Jar); err != nil {
 			utils.Debugf("[MANAGER] apply cookies (%s): %v", name, err)
+		} else if sub == control.SubtypeCookiesOffer && cp.RequestID != "" && len(cp.RequestID) <= 64 {
+			m.mu.Lock()
+			if m.verificationIDs == nil {
+				m.verificationIDs = make(map[string]string)
+			}
+			m.verificationIDs[name] = cp.RequestID
+			m.mu.Unlock()
 		}
 	}
 }
@@ -659,6 +684,10 @@ func (m *Manager) OfferCookies(name string, jar map[string]string) error {
 }
 
 func (m *Manager) OfferCookiesForDomain(name, domain string, jar map[string]string) error {
+	return m.OfferBrowserCookiesForDomain(name, domain, jar, "")
+}
+
+func (m *Manager) OfferBrowserCookiesForDomain(name, domain string, jar map[string]string, requestID string) error {
 	if domain != "" {
 		root, ok := yandexhosts.Root(domain)
 		if !ok {
@@ -669,7 +698,7 @@ func (m *Manager) OfferCookiesForDomain(name, domain string, jar map[string]stri
 	// name comes from the exit's AuthRequired request. It is the exit's
 	// name, not necessarily this side's entry; attaching a local document
 	// URL here could reroute the answer to a different exit carrier.
-	body, err := (&control.CookiesPayload{Transport: name, Domain: domain, Jar: jar, Reason: "solved"}).Encode()
+	body, err := (&control.CookiesPayload{Transport: name, Domain: domain, Jar: jar, Reason: "solved", RequestID: requestID}).Encode()
 	if err != nil {
 		return err
 	}

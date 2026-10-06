@@ -56,7 +56,7 @@ func TestManifestValidation(t *testing.T) {
 		func(m *Manifest) { m.Profiles[1].ID = "1" }, func(m *Manifest) { m.Profiles[0].ID = "../1" },
 		func(m *Manifest) { m.Profiles[1].Documents = m.Profiles[0].Documents }, func(m *Manifest) { m.Profiles[1].Token = m.Profiles[0].Token },
 		func(m *Manifest) { m.Profiles[0].ClientIP = "127.0.0.1" }, func(m *Manifest) { m.Profiles[0].Documents = []string{"https://disk.yandex.ru@127.0.0.1/i/a"} },
-		func(m *Manifest) { m.Profiles[0].Transport = "unknown" }, func(m *Manifest) { m.Profiles = make([]Profile, 17) },
+		func(m *Manifest) { m.Profiles[0].Transport = "unknown" }, func(m *Manifest) { m.Profiles = make([]Profile, MaxProfiles+1) },
 		func(m *Manifest) { m.Profiles[0].VolgaURL = m.Profiles[0].Documents[0] },
 		func(m *Manifest) { m.Profiles[0].VolgaURL = m.Profiles[1].Documents[0] },
 		func(m *Manifest) { m.Profiles[0].VolgaURL = "https://evil.invalid/i/volga" },
@@ -67,6 +67,18 @@ func TestManifestValidation(t *testing.T) {
 		if m.Validate(time.Now()) == nil {
 			t.Fatal("bad manifest accepted")
 		}
+	}
+}
+
+func TestStandaloneVolgaManifestIsBounded(t *testing.T) {
+	p := profile("1")
+	p.Transport = "vyandex"
+	if err := manifest(p).Validate(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p.Documents = append(p.Documents, "https://disk.yandex.ru/i/extra")
+	if manifest(p).Validate(time.Now()) == nil {
+		t.Fatal("multiple standalone Volga documents accepted")
 	}
 }
 

@@ -179,6 +179,10 @@ func (p *LazyProxy) Reap(now time.Time, idle time.Duration) {
 	}
 }
 
+// LastDataTime excludes transport/session heartbeats. It is safe to export
+// only as aggregate activity metadata, never packet contents.
+func (p *LazyProxy) LastDataTime() time.Time { return time.Unix(0, p.lastActive.Load()) }
+
 func (p *LazyProxy) Close() {
 	p.gate.Lock()
 	if !p.closed {
