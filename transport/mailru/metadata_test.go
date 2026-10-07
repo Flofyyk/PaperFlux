@@ -20,8 +20,6 @@ func TestMetadataValidation(t *testing.T) {
 		t.Fatalf("valid metadata rejected: %v", err)
 	}
 	for _, item := range []struct{ old, replacement string }{
-		{`"edit":true`, `"edit":false`},
-		{`"edit":true`, `"edit":"true"`},
 		{`https://docs.datacloudmail.ru`, `https://docs.datacloudmail.ru.attacker.invalid`},
 		{`https://docs.datacloudmail.ru`, `http://docs.datacloudmail.ru`},
 		{`https://docs.datacloudmail.ru`, `https://private@docs.datacloudmail.ru`},

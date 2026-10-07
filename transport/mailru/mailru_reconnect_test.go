@@ -27,7 +27,7 @@ func TestStaleReaderCannotDisconnectReplacement(t *testing.T) {
 func TestWriteQueueSurvivesSessionRotation(t *testing.T) {
 	tr := NewMailruDocsTransport("Ab/Cd", transport.DefaultConfig())
 	tr.writeQueue = make(chan []byte, 2)
-	first := &DocSession{}
+	first := &DocSession{WriteQueue: tr.writeQueue}
 	tr.session = first
 	tr.SetConnected(true)
 	data := []byte("one")
@@ -36,7 +36,7 @@ func TestWriteQueueSurvivesSessionRotation(t *testing.T) {
 	}
 	data[0] = 'X'
 	tr.dropSession(first)
-	tr.session = &DocSession{}
+	tr.session = &DocSession{WriteQueue: tr.writeQueue}
 	tr.SetConnected(true)
 	if err := tr.Send([]byte("two")); err != nil {
 		t.Fatal(err)
