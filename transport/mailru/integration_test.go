@@ -15,7 +15,9 @@ func TestLargeCursorBatchIsDeliveredInOrder(t *testing.T) {
 	tr.Receive(func(p []byte) { got = append(got, p) })
 	payload := base64.StdEncoding.EncodeToString([]byte("first"))
 	frame := `42["message",{"padding":"` + strings.Repeat("x", 300<<10) + `","type":"cursor","cursors":[{"cursor":"18;` + payload + `"},{"cursor":"18;c2Vjb25k"}]}]`
-	tr.handleMessage(&DocSession{}, []byte(frame))
+	session := &DocSession{}
+	tr.session = session
+	tr.handleMessage(session, []byte(frame))
 	if len(got) != 2 || string(got[0]) != "first" || string(got[1]) != "second" {
 		t.Fatal("large batch lost or reordered packets")
 	}

@@ -45,7 +45,9 @@ func TestHandleMessageDeliversEveryPacketOfABatch(t *testing.T) {
 	tr.Receive(func(b []byte) { got = append(got, string(b)) })
 	msg := `42["message",{"type":"cursor","messages":[` + cursorEntry("---KA---") + "," +
 		cursorEntry(b64("first")) + "," + cursorEntry(b64("second")) + `]}]`
-	tr.handleMessage(&DocSession{}, []byte(msg))
+	session := &DocSession{}
+	tr.session = session
+	tr.handleMessage(session, []byte(msg))
 	if !reflect.DeepEqual(got, []string{"first", "second"}) {
 		t.Fatalf("delivered %v, want [first second]", got)
 	}

@@ -111,6 +111,10 @@ func waitMailruSocketIO(session *DocSession, token string) error {
 				}
 				continue
 			}
+			if mailruSocketRejected(text) {
+				// Provider error bodies may contain private document IDs/tokens.
+				return fmt.Errorf("mailru: Socket.IO connection rejected")
+			}
 
 			if match(text) {
 				return nil
@@ -299,7 +303,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		}
 		utils.Debugf("[M-DOCS] WebSocket connected")
 
-		conn.SetReadLimit(4 << 20)
+		conn.SetReadLimit(maxMailruEditorFrameBytes)
 		t.Mu.RLock()
 		writeQueue := t.writeQueue
 		t.Mu.RUnlock()
@@ -564,11 +568,21 @@ func BuildSaveChanges(userID string) []byte {
 }
 
 func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
+	if session != nil {
+		t.Mu.RLock()
+		current := t.session == session
+		t.Mu.RUnlock()
+		if !current {
+			return
+		}
+	}
 	text := string(data)
 
 	if text == "2" {
 		if session != nil && session.Conn != nil {
-			session.safeWrite(websocket.TextMessage, []byte("3"))
+			if err := session.safeWrite(websocket.TextMessage, []byte("3")); err != nil {
+				t.retireEditorSession(session)
+			}
 		}
 		return
 	}
@@ -576,7 +590,35 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 
-	if strings.Contains(text, `"type":"auth"`) && strings.Contains(text, `"result":1`) {
+	if mailruSocketRejected(text) {
+		utils.Infof("[M-DOCS] Socket.IO connection rejected; reconnecting")
+		t.retireEditorSession(session)
+		return
+	}
+	event := parseMailruEditorEvent(data)
+	switch event.Type {
+	case "authChanges":
+		// We advertise supportAuthChangesAck, so every history chunk needs
+		// acknowledgement before the editor can finish authentication.
+		if session != nil && session.Conn != nil {
+			if err := session.safeWrite(websocket.TextMessage, []byte(`42["message",{"type":"authChangesAck"}]`)); err != nil {
+				t.retireEditorSession(session)
+			}
+		}
+		return
+	case "disconnectReason", "error", "drop":
+		utils.Infof("[M-DOCS] editor rejected connection (event=%s code=%d); reconnecting", event.Type, event.Code)
+		t.retireEditorSession(session)
+		return
+	case "auth":
+		if event.Result == nil {
+			return
+		}
+		if *event.Result != 1 {
+			utils.Infof("[M-DOCS] editor authentication rejected (code=%d); reconnecting", *event.Result)
+			t.retireEditorSession(session)
+			return
+		}
 		utils.Infof("[M-DOCS] Editor authentication completed")
 		return
 	}
