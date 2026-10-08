@@ -4,7 +4,7 @@
 
 PaperFlux VPN tunnel server with Yandex Docs and Mail.ru Docs transports. Receives client traffic through a document channel and forwards it to the internet.
 
-The [0.5.14-mailru.1 release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.14-mailru.1) adapts the current OpenFlux Mail.ru transport: connection ordering, cursor batches and editor activity. RACK/TLP remain disabled by default for document transports.
+The [0.5.15 release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.15) fixes large Yandex authentication responses and recovery after editor rejection. Yandex session activity is extended without modifying document contents. The current OpenFlux Mail.ru adaptation is retained; RACK/TLP remain disabled by default for document transports.
 
 Use a dedicated empty document for Mail.ru: editable links receive periodic editor changes. Read-only links are accepted without those changes; connectivity still depends on the document service.
 

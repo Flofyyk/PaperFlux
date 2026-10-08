@@ -33,6 +33,7 @@ func TestCollaborativeLockAndAuthChangesAck(t *testing.T) {
 	defer c.Close()
 	carrier := NewYandexDocsTransport("https://disk.yandex.ru/i/test", transport.DefaultConfig())
 	session := &DocSession{Conn: c}
+	carrier.session = session
 	carrier.handleMessage(session, []byte(`42["message",{"type":"waitAuth"}]`))
 	if !carrier.IsConnected() {
 		t.Fatal("collaborative lock blocked cursor relay")

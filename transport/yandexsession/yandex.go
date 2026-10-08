@@ -1,6 +1,7 @@
 package yandex
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -122,6 +123,7 @@ func (t *YandexDocsTransport) Start() error {
 	t.baseUserID = randUserID()
 	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
 	utils.SafeGo("yandex.writer", t.writerLoop)
+	utils.SafeGo("yandex.editorActivity", t.editorActivityLoop)
 	t.connectToDoc(0)
 
 	return nil
@@ -254,6 +256,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
+		conn.SetReadLimit(maxEditorFrameBytes)
 
 		if !t.IsRunning() {
 			conn.Close()
@@ -414,6 +417,14 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 }
 
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
+	if session != nil {
+		t.Mu.RLock()
+		current := t.session == session
+		t.Mu.RUnlock()
+		if !current {
+			return
+		}
+	}
 	text := string(data)
 	event := parseEditorEvent(data)
 	if event.Type == "authChanges" {
@@ -433,10 +444,11 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		}
 		return
 	}
-	if event.Type == "disconnectReason" || event.Type == "error" {
+	if event.Type == "disconnectReason" || event.Type == "error" || event.Type == "drop" || text == "41" || text == "1" {
 		// Descriptions can contain private document URLs or tokens. Only a
 		// whitelisted event type and numeric code are safe to log.
 		log.Printf("[PAPERFLUX_YDOCS] lane=%d editor-event=%s code=%d", t.laneID, event.Type, event.Code)
+		t.retireEditorSession(session)
 		return
 	}
 	if event.Type == "waitAuth" && !t.IsConnected() {
@@ -475,6 +487,52 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 }
 
+// Let the existing reader schedule one serialized reconnect. Closing locally
+// also recovers when the editor sends a rejection but leaves its socket open.
+func (t *YandexDocsTransport) retireEditorSession(session *DocSession) {
+	t.Mu.Lock()
+	if session != nil && t.session != session {
+		t.Mu.Unlock()
+		return
+	}
+	t.SetConnected(false)
+	t.Mu.Unlock()
+	if session != nil && session.Conn != nil {
+		_ = session.Conn.Close()
+	}
+}
+
+// Cursor/Engine.IO keepalives do not extend the editor's idle session. This is
+// the SDK's activity operation, not saveChanges: document contents stay intact.
+func (t *YandexDocsTransport) extendEditorSession() bool {
+	t.Mu.RLock()
+	session := t.session
+	connected := t.IsConnected()
+	t.Mu.RUnlock()
+	if !connected || session == nil || session.Conn == nil {
+		return false
+	}
+	if err := session.safeWrite(websocket.TextMessage, []byte(`42["message",{"type":"extendSession","idletime":0}]`)); err != nil {
+		t.retireEditorSession(session)
+		return false
+	}
+	log.Printf("[PAPERFLUX_YDOCS] lane=%d editor activity extended", t.laneID)
+	return true
+}
+
+func (t *YandexDocsTransport) editorActivityLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.Done():
+			return
+		case <-ticker.C:
+			t.extendEditorSession()
+		}
+	}
+}
+
 type editorEvent struct {
 	Type     string `json:"type"`
 	WaitAuth bool   `json:"waitAuth"`
@@ -482,25 +540,32 @@ type editorEvent struct {
 }
 
 func parseEditorEvent(data []byte) editorEvent {
-	// Control messages are small. Do not parse large cursor/data batches a
-	// second time, and never interpret event-looking text inside a payload.
-	if len(data) > 256*1024 || !strings.HasPrefix(string(data), "42[") {
+	// authChanges contains document history and is not limited to 256 KiB.
+	// Validate the envelope, but decode only the small control fields: do not
+	// allocate copies/maps of large history or search event text in payloads.
+	if len(data) > maxEditorFrameBytes || !bytes.HasPrefix(data, []byte("42[")) || !json.Valid(data[2:]) {
 		return editorEvent{}
 	}
-	var envelope []json.RawMessage
-	if json.Unmarshal(data[2:], &envelope) != nil || len(envelope) != 2 {
+	decoder := json.NewDecoder(bytes.NewReader(data[2:min(len(data), 258)]))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
 		return editorEvent{}
 	}
 	var name string
-	if json.Unmarshal(envelope[0], &name) != nil || name != "message" {
+	if decoder.Decode(&name) != nil || name != "message" {
+		return editorEvent{}
+	}
+	body := bytes.TrimSpace(data[2+int(decoder.InputOffset()):])
+	if len(body) < 3 || body[0] != ',' || body[len(body)-1] != ']' {
 		return editorEvent{}
 	}
 	var event editorEvent
-	if json.Unmarshal(envelope[1], &event) != nil {
+	if json.Unmarshal(body[1:len(body)-1], &event) != nil {
 		return editorEvent{}
 	}
 	return event
 }
+
+const maxEditorFrameBytes = 64 << 20
 
 func (t *YandexDocsTransport) extractBase64String(response string) string {
 	if strings.Contains(response, "saveChanges") {

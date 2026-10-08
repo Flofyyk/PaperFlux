@@ -33,7 +33,8 @@ func TestCollaborativeAuthUnlockDoesNotChangeContent(t *testing.T) {
 	}
 	defer c.Close()
 	tpt := NewYandexDocsTransport("https://disk.yandex.ru/i/test", transport.DefaultConfig())
-	tpt.handleMessage(&DocSession{Conn: c}, []byte(`42["message", {"type": "connectState", "waitAuth": true}]`))
+	tpt.session = &DocSession{Conn: c}
+	tpt.handleMessage(tpt.session, []byte(`42["message", {"type": "connectState", "waitAuth": true}]`))
 	select {
 	case p := <-written:
 		var envelope []json.RawMessage

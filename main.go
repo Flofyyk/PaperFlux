@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	buildVersion = "0.5.13"
+	buildVersion = "0.5.15"
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
