@@ -2,23 +2,56 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/miekg/dns"
 	"log"
+	"net"
+	"os"
+	"strings"
 	"time"
 )
 
 // Probe DNS over TCP through the actual tunneled stack. A valid DNS response
 // verifies both TCP directions and DNS; no direct-network fallback is used.
 func (t *TCPTunnel) Probe(ctx context.Context) error {
-	var last error
-	for _, target := range []string{"77.88.8.8:53", "77.88.8.1:53"} {
-		conn, err := t.DialProbe(ctx, target)
+	return probeDNS(ctx, t.DialProbe, probeResolvers(), 6*time.Second)
+}
+
+func probeResolvers() []string {
+	values := []string{os.Getenv("PAPERFLUX_DNS_PRIMARY"), os.Getenv("PAPERFLUX_DNS_SECONDARY")}
+	defaults := []string{"77.88.8.8", "77.88.8.1"}
+	var targets []string
+	for i, value := range values {
+		ip := net.ParseIP(strings.TrimSpace(value))
+		if ip == nil {
+			ip = net.ParseIP(defaults[i])
+		}
+		target := net.JoinHostPort(ip.String(), "53")
+		if len(targets) == 0 || targets[0] != target {
+			targets = append(targets, target)
+		}
+	}
+	return targets
+}
+
+// Each resolver receives a fresh budget. The parent is the session lifetime,
+// not the first resolver's deadline. Cancellation still stops every attempt.
+func probeDNS(ctx context.Context, dial func(context.Context, string) (net.Conn, error), targets []string, timeout time.Duration) error {
+	var failures []string
+	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attempt, cancel := context.WithTimeout(ctx, timeout)
+		conn, err := dial(attempt, target)
 		if err != nil {
-			last = err
+			failures = append(failures, probeFailure(target, "tcp", err))
+			cancel()
 			continue
 		}
-		deadline, _ := ctx.Deadline()
+		stop := context.AfterFunc(attempt, func() { _ = conn.Close() })
+		deadline, _ := attempt.Deadline()
 		_ = conn.SetDeadline(deadline)
 		dc := &dns.Conn{Conn: conn}
 		q := new(dns.Msg).SetQuestion("yandex.ru.", dns.TypeA)
@@ -30,13 +63,28 @@ func (t *TCPTunnel) Probe(ctx context.Context) error {
 				err = fmt.Errorf("invalid DNS probe response")
 			}
 		}
+		if attempt.Err() != nil {
+			err = attempt.Err()
+		}
+		stop()
 		_ = conn.Close()
+		cancel()
 		if err == nil {
 			return nil
 		}
-		last = err
+		failures = append(failures, probeFailure(target, "dns", err))
 	}
-	return last
+	return fmt.Errorf("%s", strings.Join(failures, "; "))
+}
+
+// Stable, bounded public diagnostics; never include arbitrary network payloads.
+func probeFailure(target, stage string, err error) string {
+	kind := "failed"
+	var timeout net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
+		kind = "timeout"
+	}
+	return fmt.Sprintf("resolver=%s stage=%s reason=%s", target, stage, kind)
 }
 func (t *TCPTunnel) RunHealthChecks() {
 	healthy := false
@@ -54,9 +102,7 @@ func (t *TCPTunnel) RunHealthChecks() {
 		if !schedule.due(time.Now(), carrierReady) {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(t.lifecycleContext, 6*time.Second)
-		err := t.Probe(ctx)
-		cancel()
+		err := t.Probe(t.lifecycleContext)
 		schedule.completed(time.Now(), err == nil)
 		if err == nil {
 			failures = 0

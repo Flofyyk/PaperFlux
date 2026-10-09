@@ -55,11 +55,40 @@ type MailruDocsInfo struct {
 }
 
 type DocSession struct {
-	Info       MailruDocsInfo
-	Conn       *websocket.Conn
-	WriteQueue chan []byte
-	UserID     string
-	writeMu    sync.Mutex
+	Info        MailruDocsInfo
+	Conn        *websocket.Conn
+	WriteQueue  chan []byte
+	UserID      string
+	writeMu     sync.Mutex
+	readTimeout time.Duration // Negotiated before publication; reader-owned.
+}
+
+func mailruReadTimeout(open string) time.Duration {
+	var heartbeat struct {
+		PingInterval int64 `json:"pingInterval"`
+		PingTimeout  int64 `json:"pingTimeout"`
+	}
+	if len(open) < 2 || json.Unmarshal([]byte(open[1:]), &heartbeat) != nil ||
+		heartbeat.PingInterval <= 0 || heartbeat.PingTimeout <= 0 ||
+		heartbeat.PingInterval > 120000 || heartbeat.PingTimeout > 120000 {
+		return 90 * time.Second
+	}
+	budget := time.Duration(heartbeat.PingInterval+heartbeat.PingTimeout)*time.Millisecond + 15*time.Second
+	if budget < 60*time.Second {
+		return 60 * time.Second
+	}
+	return budget
+}
+
+func (s *DocSession) readMessage() (int, []byte, error) {
+	budget := s.readTimeout
+	if budget <= 0 {
+		budget = 90 * time.Second
+	}
+	if err := s.Conn.SetReadDeadline(time.Now().Add(budget)); err != nil {
+		return 0, nil, err
+	}
+	return s.Conn.ReadMessage()
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
@@ -127,7 +156,11 @@ func waitMailruSocketIO(session *DocSession, token string) error {
 	// Engine.IO open:
 	//   0{"sid":"...", ...}
 	if err := waitFor(func(text string) bool {
-		return strings.HasPrefix(text, "0{")
+		if !strings.HasPrefix(text, "0{") {
+			return false
+		}
+		session.readTimeout = mailruReadTimeout(text)
+		return true
 	}); err != nil {
 		return fmt.Errorf("mailru: wait for Engine.IO open: %w", err)
 	}
@@ -394,8 +427,11 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 
 		connectedAt := time.Now()
 		for t.IsRunning() {
-			_, message, err := conn.ReadMessage()
+			_, message, err := session.readMessage()
 			if err != nil {
+				if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+					utils.Infof("[M-DOCS] receive timeout; reconnecting document channel")
+				}
 				utils.Debugf("[M-DOCS] Read error")
 				if mailruThrottled("m-docs.drop", time.Minute) {
 					utils.Infof("[M-DOCS] connection to the document dropped; reconnecting")
