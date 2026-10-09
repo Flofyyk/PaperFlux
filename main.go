@@ -38,6 +38,7 @@ func main() {
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
+	androidProxy := flag.Bool("android-proxy", false, "Android local SOCKS5 without a TUN interface")
 	tunFdSock := flag.String("tun-fd-sock", "", "abstract Unix socket for an Android VpnService TUN descriptor")
 	packetSock := flag.String("packet-sock", "", "TCP packet bridge address for isolated Android worker")
 	useSession := flag.Bool("session", false, "Use encrypted upstream Session and batched zstd (both peers required)")
@@ -63,6 +64,9 @@ func main() {
 	flag.StringVar(&profileToken, "profile-token", "", "PaperFlux profile access token")
 	showVersion := flag.Bool("version", false, "Print PaperFlux build version")
 	flag.Parse()
+	if *androidProxy && (!*client || *exitNode || *tunFdSock != "" || *packetSock != "" || *socksAddr != "127.0.0.1:1080") {
+		log.Fatal("Android proxy requires --client --socks5 127.0.0.1:1080 and no TUN/packet bridge")
+	}
 	if *showVersion {
 		fmt.Println("PaperFlux " + buildVersion)
 		return
@@ -108,7 +112,7 @@ func main() {
 	} else {
 		log.Fatalf("Invalid --client-ip %q", *clientIPFlag)
 	}
-	if *client && (*tunFdSock != "" || *packetSock != "") {
+	if *client && (*tunFdSock != "" || *packetSock != "" || *androidProxy) {
 		configureAndroidResolver()
 	}
 
@@ -300,6 +304,20 @@ func main() {
 		select {}
 	} else {
 		log.Printf("Running as CLIENT (SOCKS5 on %s)", *socksAddr)
+		if *androidProxy {
+			// The same authenticated Session and TCP stack as VPN, but no TUN.
+			// Resolve SOCKS hostnames over the document channel, never physical DNS.
+			server := socks5.NewSOCKS5Server(*socksAddr, tunnel.NewProxyDialer(tun))
+			go func() { log.Fatal(server.Start()) }()
+			select {
+			case <-server.Ready():
+				log.Print("[PAPERFLUX] SOCKS_READY: loopback TCP proxy listening")
+			case <-time.After(2 * time.Second):
+				log.Fatal("Local SOCKS5 listener did not start")
+			}
+			go tun.RunHealthChecks()
+			select {}
+		}
 		socks5Server := socks5.NewSOCKS5Server(*socksAddr, tun)
 		log.Fatal(socks5Server.Start())
 	}
