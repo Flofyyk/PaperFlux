@@ -253,10 +253,27 @@ func (m *Manager) UseCookieStore(store *transport.CookieStore, name, key string)
 		m.cookieKeys = make(map[string]string)
 	}
 	m.cookieKeys[name] = key
+	entry := m.entries[name]
 	m.mu.Unlock()
+	if entry != nil {
+		if source, ok := entry.Provider.(interface {
+			SetCookieSaver(func(map[string]string) error)
+		}); ok {
+			source.SetCookieSaver(func(service map[string]string) error {
+				m.cookieMu.Lock()
+				defer m.cookieMu.Unlock()
+				return store.Save(key, mergeCookies(store.Load(key), service))
+			})
+		}
+	}
 	if jar := store.Load(key); len(jar) > 0 {
 		if err := m.ApplyCookiesFor(name, jar); err != nil {
 			return err
+		}
+		if entry != nil {
+			if local, ok := entry.Provider.(interface{ RestoreVerificationCookies(map[string]string) }); ok {
+				local.RestoreVerificationCookies(jar)
+			}
 		}
 	}
 	for _, root := range yandexhosts.Roots() {

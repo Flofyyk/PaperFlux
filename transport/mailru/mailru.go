@@ -8,6 +8,7 @@ package mailru
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -199,8 +200,12 @@ type MailruDocsTransport struct {
 	userCounter atomic.Int32
 	baseUserID  string
 
-	cookieJar *cookiejar.Jar
-	jarMu     sync.RWMutex
+	cookieJar            *cookiejar.Jar
+	jarMu                sync.RWMutex
+	cookieSaver          func(map[string]string) error
+	metadataMu           sync.Mutex
+	verificationRetryAt  time.Time
+	verificationFailures int
 
 	// reconnecting is set while a scheduled reconnect waits out its backoff:
 	// the reader's error and ApplyCookies both schedule one when the cookies
@@ -306,7 +311,12 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		if err != nil {
 			utils.Debugf("[M-DOCS] fetchDocInfo failed: %v", err)
 			if mailruThrottled("m-docs.fetch", time.Minute) {
-				utils.Infof("[M-DOCS] cannot open the document; retrying")
+				var verification *mailruVerificationError
+				if errors.As(err, &verification) {
+					utils.Infof("[M-DOCS] %s", verification)
+				} else {
+					utils.Infof("[M-DOCS] cannot open the document; retrying")
+				}
 			}
 			t.scheduleReconnect(attempt)
 			return
@@ -779,6 +789,12 @@ func (t *MailruDocsTransport) ApplyCookies(values map[string]string) error {
 	jar.SetCookies(u, cookies)
 
 	t.jarMu.Lock()
+	// Offers from another peer must not erase this address's verified state.
+	for _, cookie := range t.cookieJar.Cookies(u) {
+		if cookie.Name == "solution429" || cookie.Name == "hitw429" {
+			jar.SetCookies(u, []*http.Cookie{{Name: cookie.Name, Value: cookie.Value, Path: "/", Secure: true}})
+		}
+	}
 	t.cookieJar = jar
 	t.jarMu.Unlock()
 

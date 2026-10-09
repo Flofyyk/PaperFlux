@@ -31,6 +31,8 @@ func shareableCookies(jar map[string]string) map[string]string {
 		switch name {
 		case "Session_id", "sessionid2", "sessar", "sessguard", "L", "yandex_login", "lah", "mda2_beacon":
 			continue
+		case "solution429", "hitw429":
+			continue // Mail.ru WAF verification belongs to the sender's address.
 		}
 		out[name] = value
 	}

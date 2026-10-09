@@ -22,7 +22,12 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 }
 
 func (t *MailruDocsTransport) fetchDocInfoFrom(client *http.Client, apiURL, weblink string) (MailruDocsInfo, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	t.metadataMu.Lock()
+	defer t.metadataMu.Unlock()
+	if remaining := time.Until(t.verificationRetryAt); remaining > 0 {
+		return MailruDocsInfo{}, &mailruVerificationError{RetryAfter: remaining}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	done := t.Done()
 	go func() {
@@ -42,39 +47,90 @@ func (t *MailruDocsTransport) fetchDocInfoFrom(client *http.Client, apiURL, webl
 
 	utils.Debugf("[M-DOCS] fetch document metadata")
 
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(jsonData))
-	if err != nil {
+	api, err := url.Parse(apiURL)
+	if err != nil || api.Host == "" || api.User != nil {
 		return MailruDocsInfo{}, fmt.Errorf("invalid Mail.ru API request")
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", mailruUserAgent)
-	req.Header.Set("X-Api-Version", "4")
-	req.Header.Set("Referer", fmt.Sprintf("https://cloud.mail.ru/public/%s?weblink=%s", weblink, weblink))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		// URL errors may contain the private document link after redirects.
-		if ctx.Err() != nil {
-			return MailruDocsInfo{}, ctx.Err()
+	// Keep the shared cookie jar, but never follow a provider redirect off-origin.
+	guarded := *client
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 || req.URL.Scheme != api.Scheme || req.URL.Host != api.Host || req.URL.User != nil {
+			return fmt.Errorf("Mail.ru API redirect rejected")
 		}
-		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API connection failed")
+		req.Header.Set("User-Agent", mailruUserAgent)
+		if client.CheckRedirect != nil {
+			return client.CheckRedirect(req, via)
+		}
+		return nil
 	}
+	for attempt := 0; attempt < 2; attempt++ {
+		// Recreate the POST from the original data: the challenge's redirect can
+		// legitimately finish at the API by GET (405), which is not our retry.
+		req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(jsonData))
+		if err != nil {
+			return MailruDocsInfo{}, fmt.Errorf("invalid Mail.ru API request")
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("User-Agent", mailruUserAgent)
+		req.Header.Set("X-Api-Version", "4")
+		req.Header.Set("Referer", fmt.Sprintf("https://cloud.mail.ru/public/%s?weblink=%s", weblink, weblink))
+		resp, err := guarded.Do(req)
+		if err != nil {
+			// URL errors can expose document links or signed challenge parameters.
+			if ctx.Err() != nil {
+				return MailruDocsInfo{}, ctx.Err()
+			}
+			return MailruDocsInfo{}, fmt.Errorf("Mail.ru API connection failed")
+		}
+		body, readErr := readMailruMetadataResponse(resp)
+		if readErr != nil {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return MailruDocsInfo{}, t.deferMailruVerification(resp.Header.Get("Retry-After"))
+			}
+			return MailruDocsInfo{}, readErr
+		}
+		if isMailru429Page(body) {
+			if attempt == 0 {
+				confirmationErr := t.confirmMailru429(ctx, &guarded, resp.Request.URL, body)
+				if ctx.Err() != nil {
+					return MailruDocsInfo{}, ctx.Err()
+				}
+				if confirmationErr == nil {
+					utils.Infof("[M-DOCS] browser verification completed; retrying document request")
+					continue
+				}
+				utils.Debugf("[M-DOCS] browser verification failed: %v", confirmationErr)
+			}
+			return MailruDocsInfo{}, t.deferMailruVerification(resp.Header.Get("Retry-After"))
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return MailruDocsInfo{}, t.deferMailruVerification(resp.Header.Get("Retry-After"))
+		}
+		if resp.StatusCode != http.StatusOK {
+			return MailruDocsInfo{}, fmt.Errorf("API returned status %d", resp.StatusCode)
+		}
+		info, err := parseMailruDocInfo(body)
+		if err == nil {
+			t.verificationFailures = 0
+			t.verificationRetryAt = time.Time{}
+		}
+		return info, err
+	}
+	return MailruDocsInfo{}, t.deferMailruVerification("")
+}
+
+func readMailruMetadataResponse(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return MailruDocsInfo{}, fmt.Errorf("API returned status %d", resp.StatusCode)
-	}
-
 	const maxMetadata = 2 << 20
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadata+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadata+1))
 	if err != nil {
-		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API response could not be read")
+		return nil, fmt.Errorf("Mail.ru API response could not be read")
 	}
-	if len(bodyBytes) > maxMetadata {
-		return MailruDocsInfo{}, fmt.Errorf("Mail.ru API response too large")
+	if len(body) > maxMetadata {
+		return nil, fmt.Errorf("Mail.ru API response too large")
 	}
-	return parseMailruDocInfo(bodyBytes)
+	return body, nil
 }
 
 func parseMailruDocInfo(bodyBytes []byte) (MailruDocsInfo, error) {

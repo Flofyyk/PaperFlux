@@ -71,6 +71,8 @@ func shareMailruCookie(name string) bool {
 	switch strings.ToLower(name) {
 	case "mpop", "m_auth2", "m_auth", "auth", "auth_token", "access_token", "refresh_token", "password":
 		return false
+	case "solution429", "hitw429":
+		return false // Address-bound WAF cookies remain in the local profile store.
 	}
 	return len(name) > 0 && len(name) < 256
 }
