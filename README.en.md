@@ -4,7 +4,7 @@
 
 PaperFlux VPN tunnel server with Yandex Docs and Mail.ru Docs transports. Receives client traffic through a document channel and forwards it to the internet.
 
-The [0.5.17 release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.17) fixes DNS fallback and detects silent Mail.ru connections. Tunnel checks use Android's configured DNS servers and report failure details. Large authentication responses and recovery after editor rejection remain supported.
+The [0.5.18 release](https://github.com/Flofyyk/PaperFlux/releases/tag/v0.5.18) handles Mail.ru browser verification, persists its result, and retries the original request without changing its method. Repeated rate limits trigger a cooldown. DNS fallback, silent-connection detection, large authentication responses, and recovery after editor rejection remain supported.
 
 Use a dedicated empty document for Mail.ru: editable links receive periodic editor changes. Read-only links are accepted without those changes; connectivity still depends on the document service.
 
