@@ -4,6 +4,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"universal-bypass-tool/transport/control"
 )
 
 func fastKeepalive(sessions ...*Session) {
@@ -75,14 +77,47 @@ func TestSessionPrefersHigherPriorityCarrier(t *testing.T) {
 	exit.Receive(func([]byte) { got.Add(1) })
 	startPair(t, client, exit)
 
-	before := sentCount(cw["yandex"])
+	// Hellos can still be queued on another carrier after both sessions become
+	// ready. Count authenticated data envelopes, not asynchronous control frames.
+	dataCount := func() int {
+		w := cw["yandex"]
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		aead := client.links["yandex"].encrypted.sendAEAD
+		count := 0
+		for _, packet := range w.packets {
+			nonceEnd := encryptedHeader + aead.NonceSize()
+			if len(packet) < nonceEnd+aead.Overhead() {
+				t.Fatal("truncated encrypted test packet")
+			}
+			plain, err := aead.Open(nil, packet[encryptedHeader:nonceEnd], packet[nonceEnd:], packet[:encryptedHeader])
+			if err != nil {
+				t.Fatal(err)
+			}
+			frames, err := decodeBatch(plain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, frame := range frames {
+				envelope, err := control.Decode(frame)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if envelope.Kind == control.KindIPv4 {
+					count++
+				}
+			}
+		}
+		return count
+	}
+	before := dataCount()
 	for i := 0; i < 5; i++ {
 		if err := client.Send(testIPv4(40, 6)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	eventually(t, "data delivery", func() bool { return got.Load() == 5 })
-	if after := sentCount(cw["yandex"]); after != before {
+	if after := dataCount(); after != before {
 		t.Fatalf("lower-priority carrier carried data while the preferred one was live (%d -> %d)", before, after)
 	}
 }

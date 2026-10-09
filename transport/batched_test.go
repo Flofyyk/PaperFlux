@@ -136,7 +136,11 @@ func TestBatchedTransportRoundTripPreservesPacketsAndOrder(t *testing.T) {
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	eventually(t, "all batched packets to arrive", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) >= len(want)
+	})
 
 	mu.Lock()
 	defer mu.Unlock()
